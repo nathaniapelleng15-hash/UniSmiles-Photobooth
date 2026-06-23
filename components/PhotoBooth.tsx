@@ -934,11 +934,26 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           sessionId: resultTimestamp,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Gagal kirim email');
-      setIsSent(true);
+
+      let errorMessage = 'Gagal kirim email';
+      if (res.ok) {
+        setIsSent(true);
+      } else {
+        try {
+          const data = await res.json();
+          errorMessage = data.error || errorMessage;
+        } catch (_) {
+          errorMessage = `Server merespon dengan status ${res.status}`;
+        }
+        throw new Error(errorMessage);
+      }
     } catch (err: any) {
-      setEmailError(err.message || 'Terjadi kesalahan. Coba lagi.');
+      console.error('Email send error:', err);
+      if (err.name === 'TypeError' || err.message.includes('fetch') || err.message.includes('Load failed')) {
+        setEmailError('Koneksi ke backend gagal. Pastikan backend Render Anda sudah aktif.');
+      } else {
+        setEmailError(err.message || 'Terjadi kesalahan. Coba lagi.');
+      }
     } finally {
       setIsSending(false);
     }
