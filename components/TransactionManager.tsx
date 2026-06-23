@@ -13,6 +13,8 @@ import {
   HelpCircle
 } from 'lucide-react';
 
+const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:3001`;
+
 export const TransactionManager: React.FC = () => {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
@@ -33,9 +35,14 @@ export const TransactionManager: React.FC = () => {
     setError(null);
     try {
       // Fetch from backend
-      const response = await fetch('http://localhost:3001/api/transactions?limit=200');
+      const response = await fetch(`${API_BASE_URL}/api/transactions?limit=200`);
       if (!response.ok) {
-        throw new Error('Failed to connect to backend server');
+        const data = await response.json().catch(() => null);
+        const message = data?.detail || data?.error || 'Failed to connect to backend server';
+        if (message.includes('Access denied') || message.includes('ECONNREFUSED')) {
+          throw new Error('Database MySQL belum terhubung. Isi DB_PASSWORD di server/.env lalu restart backend.');
+        }
+        throw new Error(message);
       }
       const data = await response.json();
       if (data.success) {

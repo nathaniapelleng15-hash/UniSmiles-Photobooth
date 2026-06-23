@@ -16,8 +16,9 @@ const SHUTTER_SOUND_URL = "https://assets.mixkit.co/active_storage/sfx/2578/2578
 const COUNTDOWN_SOUND_URL = "https://cdn.pixabay.com/download/audio/2022/03/24/audio_cda640386c.mp3?filename=beep-6-96243.mp3";
 
 // API — Local Node.js server (port 3001)
-const UPLOAD_API_URL = "http://localhost:3001/api/photos/upload";
-const BASE_RESULT_URL = "http://localhost:3001/uploads/";
+const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:3001`;
+const UPLOAD_API_URL = `${API_BASE_URL}/api/photos/upload`;
+const BASE_RESULT_URL = `${API_BASE_URL}/uploads/`;
 // API_KEY tidak diperlukan lagi (server lokal)
 
 interface PhotoBoothProps {
@@ -816,7 +817,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const handlePaymentConfirm = async () => {
     const price = frames.find(f => f.id === selectedLayoutId)?.price || 45000;
     try {
-      await fetch('http://localhost:3001/api/transactions', {
+      await fetch(`${API_BASE_URL}/api/transactions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -923,7 +924,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         photoBase64 = generated; // data:image/png;base64,...
       }
 
-      const res = await fetch('http://localhost:3001/api/email/send', {
+      const res = await fetch(`${API_BASE_URL}/api/email/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

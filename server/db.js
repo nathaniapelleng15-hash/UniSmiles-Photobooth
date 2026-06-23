@@ -1,7 +1,12 @@
 import mysql from 'mysql2/promise';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-dotenv.config({ override: true });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.join(__dirname, '.env'), override: true });
 
 // Pool koneksi MySQL (lebih efisien dari single connection)
 const pool = mysql.createPool({
@@ -43,8 +48,11 @@ export const testConnection = async () => {
     conn.release();
   } catch (err) {
     console.error('❌ Gagal konek ke MySQL:', err.message);
+    console.error(
+      `   Config: ${process.env.DB_USER || 'root'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || '3306'}/${process.env.DB_NAME || 'unismile_db'}`
+    );
     console.error('   Pastikan MySQL Server sudah running dan credentials di .env sudah benar.');
-    process.exit(1); // Stop server jika DB tidak bisa connect
+    return false;
   }
 };
 

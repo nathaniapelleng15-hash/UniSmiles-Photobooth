@@ -12,7 +12,6 @@ import {
   Settings, 
   Image as ImageIcon, 
   LogOut, 
-  Camera, 
   Lock, 
   LayoutTemplate, 
   Wand2, 
@@ -163,7 +162,7 @@ const App: React.FC = () => {
           <aside className="w-64 bg-white border-r border-gray-200 hidden md:flex flex-col">
             <div className="p-6 border-b border-gray-100">
               <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2">
-                <Camera className="text-indigo-600" />
+                <img src="/assets/LOGO UNI SMILE.png" alt="UniSmile" className="h-12 w-12 object-contain" />
                 Admin Panel
               </h2>
             </div>

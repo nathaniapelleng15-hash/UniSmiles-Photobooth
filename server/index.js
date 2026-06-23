@@ -8,10 +8,10 @@ import dotenv     from 'dotenv';
 import nodemailer from 'nodemailer';
 import pool, { testConnection } from './db.js';
 
-dotenv.config({ override: true });
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
+
+dotenv.config({ path: path.join(__dirname, '.env'), override: true });
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -26,10 +26,10 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: ['http://localhost:5175', 'http://localhost:5173', 'http://localhost:3000'],
+  origin: true,
   methods: ['GET', 'POST', 'DELETE'],
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // Serve file foto statis — GET /uploads/filename.png
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -259,7 +259,8 @@ app.get('/api/transactions', async (req, res) => {
     });
   } catch (err) {
     console.error('❌ Gagal mengambil transaksi:', err.message);
-    res.status(500).json({ error: 'Gagal mengambil data transaksi', detail: err.message });
+    const isDbConnectionError = ['ER_ACCESS_DENIED_ERROR', 'ECONNREFUSED', 'ENOTFOUND'].includes(err.code);
+    res.status(isDbConnectionError ? 503 : 500).json({ error: 'Gagal mengambil data transaksi', detail: err.message });
   }
 });
 
@@ -393,8 +394,11 @@ app.post('/api/email/send', async (req, res) => {
     return res.status(400).json({ error: 'Format email tidak valid' });
   }
 
+  const gmailUser = (process.env.GMAIL_USER || '').trim();
+  const gmailAppPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
+
   // Cek apakah Gmail credentials sudah dikonfigurasi
-  if (!process.env.GMAIL_USER || process.env.GMAIL_USER === 'your_email@gmail.com') {
+  if (!gmailUser || gmailUser === 'your_email@gmail.com' || !gmailAppPassword) {
     return res.status(503).json({ 
       error: 'Fitur email belum dikonfigurasi. Hubungi admin untuk mengatur Gmail credentials di server/.env' 
     });
@@ -405,8 +409,8 @@ app.post('/api/email/send', async (req, res) => {
     const transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD,
+        user: gmailUser,
+        pass: gmailAppPassword,
       },
     });
 
@@ -481,7 +485,7 @@ app.post('/api/email/send', async (req, res) => {
 
     // Kirim email dengan template HTML
     const info = await transporter.sendMail({
-      from: `"UniSmile Photo Booth" <${process.env.GMAIL_USER}>`,
+      from: `"UniSmile Photo Booth" <${gmailUser}>`,
       to,
       subject: '📸 Foto Kamu dari UniSmile Photo Booth!',
       attachments,
