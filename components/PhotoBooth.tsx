@@ -15,8 +15,8 @@ const GLOBAL_SCALE = 1.0;
 const SHUTTER_SOUND_URL = "https://assets.mixkit.co/active_storage/sfx/2578/2578-preview.mp3";
 const COUNTDOWN_SOUND_URL = "https://cdn.pixabay.com/download/audio/2022/03/24/audio_cda640386c.mp3?filename=beep-6-96243.mp3";
 
-// API — Local Node.js server (port 3001)
-const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:3001`;
+// API — Production backend (Render)
+const API_BASE_URL = "https://unismile-backend.onrender.com";
 const UPLOAD_API_URL = `${API_BASE_URL}/api/photos/upload`;
 const BASE_RESULT_URL = `${API_BASE_URL}/uploads/`;
 // API_KEY tidak diperlukan lagi (server lokal)
