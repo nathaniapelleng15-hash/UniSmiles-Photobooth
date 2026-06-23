@@ -7,7 +7,7 @@ import { StickerIcon, AppConfig, STORAGE_KEYS, DEFAULT_PASSWORD, FrameLayout, Ph
 export const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxcSs47NFiYCG7t0FiKbwfxvBg_D_48mzkWN8v_1HNYx-lDx87UyOsvbpsFHgEO7Ko6/exec"; 
 
 const UPLOAD_API_URL = "https://repofoto.kolab.top";
-const LOCAL_API_URL = "https://unismile-backend.onrender.com";
+const LOCAL_API_URL = "https://unismiles-photobooth-production.up.railway.app";
 const API_KEY = "Kolab@2311";
 
 // --- API HELPER FUNCTIONS ---

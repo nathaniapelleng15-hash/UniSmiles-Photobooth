@@ -13,7 +13,7 @@ import {
   HelpCircle
 } from 'lucide-react';
 
-const API_BASE_URL = "https://unismile-backend.onrender.com";
+const API_BASE_URL = "https://unismiles-photobooth-production.up.railway.app";
 
 export const TransactionManager: React.FC = () => {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
