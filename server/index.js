@@ -57,8 +57,22 @@ const upload = multer({
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // Health check
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', server: 'UniSmile Photo Server', time: new Date().toISOString() });
+app.get('/api/health', async (_req, res) => {
+  let dbStatus = 'disconnected';
+  try {
+    const [rows] = await pool.execute('SELECT 1 as val');
+    if (rows && rows[0]?.val === 1) {
+      dbStatus = 'connected';
+    }
+  } catch (err) {
+    dbStatus = `error: ${err.message}`;
+  }
+  res.json({ 
+    status: 'ok', 
+    server: 'UniSmile Photo Server', 
+    database: dbStatus,
+    time: new Date().toISOString() 
+  });
 });
 
 // ── POST /api/photos/upload ──────────────────────────────────────────────────
