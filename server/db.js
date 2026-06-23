@@ -19,6 +19,7 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
   timezone: '+07:00', // WIB
+  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
 });
 
 // Test koneksi saat startup
