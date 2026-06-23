@@ -1081,19 +1081,34 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           const dataUrl = await generateCompositeImage();
           if (!dataUrl) throw new Error("Generation failed");
 
-          const res = await fetch(dataUrl);
-          const blob = await res.blob();
-          const formData = new FormData();
-          formData.append('file', blob, `${resultTimestamp}.png`);
-          formData.append('session_id', resultTimestamp);
-          formData.append('layout_id', selectedLayoutId || '');
-
-          const uploadRes = await fetch(UPLOAD_API_URL, { method: 'POST', body: formData });
-          if (!uploadRes.ok) throw new Error("Upload failed");
-
-          const serverUrl = `${BASE_RESULT_URL}${resultTimestamp}.png`;
+          // Simpan base64 lokal dulu — ini yang akan dipakai email jika upload gagal
+          setFinalUploadedUrl(dataUrl);
           setUploadStatus('success');
-          setFinalUploadedUrl(serverUrl);
+
+          // Coba upload ke backend (opsional — tidak crash jika gagal)
+          try {
+              const res = await fetch(dataUrl);
+              const blob = await res.blob();
+              const formData = new FormData();
+              formData.append('file', blob, `${resultTimestamp}.png`);
+              formData.append('session_id', resultTimestamp);
+              formData.append('layout_id', selectedLayoutId || '');
+
+              const uploadRes = await fetch(UPLOAD_API_URL, { 
+                  method: 'POST', 
+                  body: formData,
+                  signal: AbortSignal.timeout(10000) // timeout 10 detik
+              });
+              
+              if (uploadRes.ok) {
+                  const serverUrl = `${BASE_RESULT_URL}${resultTimestamp}.png`;
+                  setFinalUploadedUrl(serverUrl);
+                  console.log('✅ Foto berhasil diupload ke server:', serverUrl);
+              }
+          } catch (uploadErr) {
+              // Backend tidak tersedia — pakai base64 lokal (sudah di-set di atas)
+              console.warn('⚠️ Upload ke backend gagal, menggunakan base64 lokal:', uploadErr);
+          }
       } catch (error) {
           console.error(error);
           setUploadStatus('error');
