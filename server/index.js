@@ -418,12 +418,23 @@ app.post('/api/email/send', async (req, res) => {
     await transporter.verify();
 
     // Siapkan gambar & attachment
-    const logoPath = path.join(__dirname, '../public/assets/LOGO UNI SMILE.png');
-    let attachments = [{
+    const logoPath = path.join(__dirname, 'assets/LOGO UNI SMILE.png');
+    const devLogoPath = path.join(__dirname, '../public/assets/LOGO UNI SMILE.png');
+    const finalLogoPath = fs.existsSync(logoPath) ? logoPath : (fs.existsSync(devLogoPath) ? devLogoPath : null);
+
+    let attachments = [];
+    let logoImgSrc = '';
+
+    if (finalLogoPath) {
+      attachments.push({
         filename: 'unismile-logo.png',
-        path: logoPath,
+        path: finalLogoPath,
         cid: 'logo@unismile'
-    }];
+      });
+      logoImgSrc = 'cid:logo@unismile';
+    } else {
+      logoImgSrc = 'https://unismile-photobooth.nathaniapelleng15.workers.dev/assets/LOGO%20UNI%20SMILE.png';
+    }
     let photoImgTag = '';
     let downloadBtn = '';
 
@@ -506,7 +517,7 @@ app.post('/api/email/send', async (req, res) => {
                   <!-- Header -->
                   <tr>
                     <td style="background:linear-gradient(135deg,#1b2b5a,#0c1633);padding:32px 24px;text-align:center;border-bottom:2px solid rgba(246,205,70,0.3);">
-                      <img src="cid:logo@unismile" alt="UniSmile Logo" style="height:48px;display:block;margin:0 auto 12px;border-radius:12px;">
+                      <img src="${logoImgSrc}" alt="UniSmile Logo" style="height:48px;display:block;margin:0 auto 12px;border-radius:12px;">
                     </td>
                   </tr>
 
