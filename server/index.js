@@ -132,8 +132,7 @@ app.get('/api/photos', async (req, res) => {
       `SELECT id, filename, url, session_id, layout_id, file_size, created_at
        FROM photos
        ORDER BY created_at DESC
-       LIMIT ? OFFSET ?`,
-      [limit, offset]
+       LIMIT ${limit} OFFSET ${offset}`
     );
 
     const [[{ total }]] = await pool.execute('SELECT COUNT(*) as total FROM photos');
@@ -247,8 +246,7 @@ app.get('/api/transactions', async (req, res) => {
       `SELECT id, transaction_code, session_id, layout_id, amount, payment_method, status, created_at
        FROM transactions
        ORDER BY created_at DESC
-       LIMIT ? OFFSET ?`,
-      [limit, offset]
+       LIMIT ${limit} OFFSET ${offset}`
     );
 
     // Query stats: total transaksi & total nominal
