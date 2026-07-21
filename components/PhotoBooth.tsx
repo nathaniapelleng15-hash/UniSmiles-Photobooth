@@ -7,7 +7,7 @@ import {
 import { FrameLayout, FrameStyle, PhotoFilter, GridLayoutId, VirtualBackground, FrameElement } from '../types';
 import { getStoredFrames, getStoredFilters, getLayoutConfig, getStoredBackgrounds, getAppConfig } from '../services/storageService';
 import { useAirGesture } from './useAirGesture';
-import { startSession, completeSession, uploadPhoto, sendPhotoByEmail, getPaymentProfile, verifyPayment } from '../services/apiService';
+import { startSession, completeSession, uploadPhoto, sendPhotoByEmail, fetchPaymentProfile, verifyPayment, fetchTemplates } from '../services/apiService';
 
 // Global Scale (Now 1.0 since we removed transform scale from index.html)
 const GLOBAL_SCALE = 1.0;
@@ -404,13 +404,20 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [finalUploadedUrl, setFinalUploadedUrl] = useState<string | null>(null);
 
   useEffect(() => {
-    const allFrames = getStoredFrames(); // Removed filter here to get complete list, filtering happens in LAYOUT step
-    setFrames(allFrames);
+    fetchTemplates().then(templates => {
+      if (templates && templates.length > 0) {
+        setFrames(templates);
+      } else {
+        const allFrames = getStoredFrames(); // fallback
+        setFrames(allFrames);
+      }
+    });
+
     const allFilters = getStoredFilters().filter(f => f.enabled);
     setFilters(allFilters);
     setBackgrounds(getStoredBackgrounds());
     
-    getPaymentProfile().then(url => { if (url) setQrisUrl(url); });
+    fetchPaymentProfile().then(url => { if (url) setQrisUrl(url); });
     
     const appConfig = getAppConfig();
     setCustomSubtitle(appConfig.customSubtitle || '');

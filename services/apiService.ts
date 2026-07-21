@@ -258,7 +258,21 @@ export const getPhotosBySession = async (sessionId: string): Promise<PhotoData[]
   return []; // Not used in V1 kiosk API docs directly for kiosk display, but kept for compat
 };
 
-export const getPaymentProfile = async (): Promise<string | null> => {
+export const fetchTemplates = async (): Promise<any[]> => {
+  try {
+    const res = await apiFetch('/api/v1/kiosk/templates');
+    const data = await res.json();
+    if (res.ok && data.success) {
+      return data.data || [];
+    }
+    return [];
+  } catch (error) {
+    console.error('Error fetchTemplates:', error);
+    return [];
+  }
+};
+
+export const fetchPaymentProfile = async (): Promise<string | null> => {
   try {
     const res = await apiFetch('/api/v1/kiosk/payments');
     const data = await res.json();
