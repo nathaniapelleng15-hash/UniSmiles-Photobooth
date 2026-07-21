@@ -7,7 +7,7 @@ import {
 import { FrameLayout, FrameStyle, PhotoFilter, GridLayoutId, VirtualBackground, FrameElement } from '../types';
 import { getStoredFrames, getStoredFilters, getLayoutConfig, getStoredBackgrounds, getAppConfig } from '../services/storageService';
 import { useAirGesture } from './useAirGesture';
-import { startSession, completeSession, uploadPhoto, sendPhotoByEmail } from '../services/apiService';
+import { startSession, completeSession, uploadPhoto, sendPhotoByEmail, getPaymentProfile, verifyPayment } from '../services/apiService';
 
 // Global Scale (Now 1.0 since we removed transform scale from index.html)
 const GLOBAL_SCALE = 1.0;
@@ -399,7 +399,8 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [isSent, setIsSent] = useState(false);
   const [emailError, setEmailError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'preparing' | 'uploading' | 'success' | 'error'>('idle');
-  const [resultTimestamp, setResultTimestamp] = useState<string>('');
+  const [sessionCode, setSessionCode] = useState<string>('');
+  const [qrisUrl, setQrisUrl] = useState<string | null>(null);
   const [finalUploadedUrl, setFinalUploadedUrl] = useState<string | null>(null);
 
   useEffect(() => {
@@ -408,6 +409,8 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     const allFilters = getStoredFilters().filter(f => f.enabled);
     setFilters(allFilters);
     setBackgrounds(getStoredBackgrounds());
+    
+    getPaymentProfile().then(url => { if (url) setQrisUrl(url); });
     
     const appConfig = getAppConfig();
     setCustomSubtitle(appConfig.customSubtitle || '');
@@ -817,26 +820,22 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     setCapturedPhotos([]); 
     setIsAutoCapturing(false); 
     
-    const timestamp = Date.now().toString();
-    setResultTimestamp(timestamp);
-    
-    // Mulai session di database backend (dummy Kiosk ID default "K-001")
-    const kioskId = import.meta.env.VITE_KIOSK_ID || 'K-001';
-    startSession(kioskId, null).catch(err => console.warn('⚠️ Gagal daftarkan sesi ke DB:', err));
+    // Mulai session di database backend
+    const kioskId = getAppConfig().kioskId || 'K-001';
+    const sessionData = await startSession(kioskId, null).catch(err => console.warn('⚠️ Gagal daftarkan sesi ke DB:', err));
+    if (sessionData && (sessionData as any).id) {
+       setSessionCode((sessionData as any).id);
+    }
     
     setStep('PAYMENT'); 
   };
   const handlePaymentConfirm = async () => {
-    const price = frames.find(f => f.id === selectedLayoutId)?.price || 45000;
-    const sessionId = `#US-${resultTimestamp}`;
     try {
-      // Panggil API completeSession baru
-      await completeSession(sessionId, {
-        transaction_code: `TRX-${resultTimestamp}`,
-        amount: price,
-        payment_method: 'QRIS',
-        status: 'completed'
-      });
+      const verified = await verifyPayment(sessionCode);
+      if (!verified) {
+          alert('Pembayaran belum diterima atau gagal diverifikasi.');
+          return;
+      }
     } catch (e) {
       console.error('Failed to log transaction:', e);
     }
@@ -896,6 +895,9 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const handleHome = () => {
       // Soft Reset: Clear all state to initial values instead of forcing a page reload
       // This prevents black screen issues and feels faster
+      if (sessionCode) {
+         completeSession(sessionCode).catch(e => console.error(e));
+      }
       setCapturedPhotos([]);
       setSelectedLayoutId(null);
       setSelectedBackground(null);
@@ -922,9 +924,8 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     setIsSending(true);
     setEmailError(null);
     try {
-      const sessionId = `#US-${resultTimestamp}`;
       // Panggil sendPhotoByEmail baru
-      const success = await sendPhotoByEmail(sessionId, email);
+      const success = await sendPhotoByEmail(sessionCode, email);
 
       if (success) {
         setIsSent(true);
@@ -1084,10 +1085,9 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           try {
               const res = await fetch(dataUrl);
               const blob = await res.blob();
-              const sessionId = `#US-${resultTimestamp}`;
               
               // Upload foto menggunakan apiService
-              const serverUrl = await uploadPhoto(blob, sessionId, `${resultTimestamp}.png`);
+              const serverUrl = await uploadPhoto(blob, sessionCode, `${sessionCode}.png`);
               
               if (serverUrl) {
                   setFinalUploadedUrl(serverUrl);
@@ -1117,7 +1117,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           return;
       }
 
-      const filename = `unismile-${resultTimestamp}.png`;
+      const filename = `unismile-${sessionCode || Date.now()}.png`;
 
       // Jika sudah ada URL dari server, fetch sebagai blob dulu
       // (diperlukan karena download attribute tidak bekerja cross-origin)
@@ -1519,13 +1519,17 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                                         </span>
                                     </div>
                                     <div className="flex-1 flex items-center justify-center w-full">
-                                        <img src="/assets/QRUNI.jpeg" alt="QRIS Uni" className="w-full h-auto max-h-[45vh] lg:max-h-[50vh] object-contain rounded-xl" />
+                                        {qrisUrl ? (
+                                            <img src={qrisUrl} alt="QRIS Uni" className="w-full h-auto max-h-[45vh] lg:max-h-[50vh] object-contain rounded-xl" />
+                                        ) : (
+                                            <div className="w-full h-[40vh] flex items-center justify-center text-gray-400">Loading QRIS...</div>
+                                        )}
                                     </div>
                                 </div>
                                 
                                 {/* Check Status Button Outside the Square */}
                                 <button onClick={handlePaymentConfirm} className="mt-4 md:mt-6 w-full bg-[#f6cd46] hover:bg-[#e5bc35] text-black py-3 md:py-4 rounded-xl text-lg md:text-xl font-bold shadow-[0_10px_20px_rgba(246,205,70,0.3)] transition-all active:scale-95">
-                                    Check Status
+                                    I Have Paid
                                 </button>
                             </div>
                         </div>

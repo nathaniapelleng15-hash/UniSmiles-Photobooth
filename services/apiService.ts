@@ -111,13 +111,17 @@ const apiFetch = async (
  * Cek apakah backend server aktif.
  * Tidak butuh auth — bisa dipanggil saat kiosk startup.
  */
-export const checkBackendHealth = async (customUrl?: string): Promise<boolean> => {
-  const targetUrl = customUrl || getApiConfig().backendUrl;
+export const checkBackendHealth = async (url: string, currentApiKey: string): Promise<boolean> => {
   try {
-    const res = await fetch(`${targetUrl}/`);
-    if (res.ok) {
-      const data = await res.json();
-      console.log('✅ Backend terhubung:', data.message);
+    const targetUrl = url || getApiConfig().backendUrl;
+    const res = await fetch(`${targetUrl}/payments`, {
+      method: 'GET',
+      headers: {
+        'x-api-key': currentApiKey
+      }
+    });
+    if (res.status === 200) {
+      console.log('✅ Backend terhubung & API Key valid');
       return true;
     }
     return false;
@@ -144,21 +148,19 @@ export const startSession = async (
   const sessionId = `#US-${Date.now()}`;
 
   try {
-    const res = await apiFetch('/api/sessions/start', {
+    const res = await apiFetch('/api/v1/kiosk/sessions/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        id: sessionId,
-        kiosk_id: kioskId,
         frame_template_id: frameTemplateId || null
       })
     });
 
     const data: ApiResponse<SessionData> = await res.json();
 
-    if (res.ok && data.success) {
-      console.log(`🎬 Sesi dimulai: ${sessionId}`);
-      return data.data!;
+    if (res.ok && data.success && data.session_code) {
+      console.log(`🎬 Sesi dimulai: ${data.session_code}`);
+      return { id: data.session_code, kiosk_id: kioskId, status: 'active' } as SessionData;
     } else {
       console.error('Gagal memulai sesi:', data.message);
       return null;
@@ -177,14 +179,12 @@ export const startSession = async (
  * @param transaction - Data transaksi pembayaran
  */
 export const completeSession = async (
-  sessionId: string,
-  transaction: TransactionPayload
+  sessionId: string
 ): Promise<boolean> => {
   try {
-    const res = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/complete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(transaction)
+    const res = await apiFetch(`/api/v1/kiosk/sessions/${encodeURIComponent(sessionId)}/complete`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' }
     });
 
     const data: ApiResponse = await res.json();
@@ -227,10 +227,9 @@ export const uploadPhoto = async (
   formData.append('session_id', sessionId);
 
   try {
-    const res = await apiFetch('/api/photos', {
+    const res = await apiFetch(`/api/v1/kiosk/sessions/${encodeURIComponent(sessionId)}/photos`, {
       method: 'POST',
       body: formData
-      // Tidak perlu Content-Type header — browser set otomatis untuk multipart/form-data
     });
 
     const data: ApiResponse<PhotoData> = await res.json();
@@ -255,28 +254,37 @@ export const uploadPhoto = async (
   }
 };
 
-/**
- * Ambil semua foto dari satu sesi.
- * Digunakan di halaman preview hasil foto.
- */
 export const getPhotosBySession = async (sessionId: string): Promise<PhotoData[]> => {
-  const config = getApiConfig();
-  try {
-    const res = await fetch(
-      `${config.backendUrl}/api/photos/session/${encodeURIComponent(sessionId)}`
-    );
-    const data: ApiResponse<PhotoData[]> = await res.json();
+  return []; // Not used in V1 kiosk API docs directly for kiosk display, but kept for compat
+};
 
-    if (res.ok && data.success) {
-      return (data.data || []).map(p => ({
-        ...p,
-        url: p.url.startsWith('http') ? p.url : `${config.backendUrl}${p.url}`
-      }));
+export const getPaymentProfile = async (): Promise<string | null> => {
+  try {
+    const res = await apiFetch('/api/v1/kiosk/payments');
+    const data = await res.json();
+    if (res.ok && data.success && data.data && data.data.length > 0) {
+      const qrisData = JSON.parse(data.data[0].payment_data);
+      const url = qrisData.qris_image_url;
+      const config = getApiConfig();
+      return url.startsWith('http') ? url : `${config.backendUrl}${url}`;
     }
-    return [];
+    return null;
   } catch (error) {
-    console.error('Error saat getPhotosBySession:', error);
-    return [];
+    console.error('Error getPaymentProfile:', error);
+    return null;
+  }
+};
+
+export const verifyPayment = async (sessionId: string): Promise<boolean> => {
+  try {
+    const res = await apiFetch(`/api/v1/kiosk/sessions/${encodeURIComponent(sessionId)}/payment`, {
+      method: 'POST'
+    });
+    const data = await res.json();
+    return res.ok && data.success;
+  } catch (error) {
+    console.error('Error verifyPayment:', error);
+    return false;
   }
 };
 
