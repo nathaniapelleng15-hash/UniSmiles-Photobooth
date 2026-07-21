@@ -88,7 +88,7 @@ const apiFetch = async (
 ): Promise<Response> => {
   const config = getApiConfig();
   const headers: Record<string, string> = {
-    'x-api-key': config.apiKey,
+    'x-api-key': config.apiKey?.trim() || '',
     ...(options.headers as Record<string, string> || {})
   };
 

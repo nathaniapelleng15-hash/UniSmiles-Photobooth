@@ -40,7 +40,8 @@ export const KioskSettings: React.FC = () => {
 
   const handleTestConnection = async () => {
     setConnectionTest('testing');
-    const isActive = await checkBackendHealth(backendUrl, apiKey);
+    const cleanApiKey = apiKey.trim();
+    const isActive = await checkBackendHealth(backendUrl, cleanApiKey);
     setConnectionTest(isActive ? 'connected' : 'disconnected');
   };
 

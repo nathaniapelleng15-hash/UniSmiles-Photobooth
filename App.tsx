@@ -45,13 +45,9 @@ const App: React.FC = () => {
 
   const handleAdminLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    // Validasi password kosong
-    if (!passwordInput || passwordInput.trim() === '') {
-      setLoginError('Password cannot be empty');
-      return;
-    }
     const config = getAppConfig();
-    if (passwordInput === config.password) {
+    const savedPassword = config.password || '123456';
+    if (passwordInput === savedPassword) {
       setCurrentView(View.ADMIN_DASHBOARD);
       setIsLoginOpen(false);
       setLoginError('');
@@ -150,6 +146,7 @@ const App: React.FC = () => {
                   placeholder="••••"
                   autoFocus
                 />
+                <p className="text-xs text-gray-500 mt-2 text-center">Default password is: 123456</p>
                 {loginError && <p id="error-message" className="text-red-500 text-sm mt-2 text-center">{loginError}</p>}
               </div>
               <button
