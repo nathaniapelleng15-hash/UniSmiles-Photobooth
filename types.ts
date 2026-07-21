@@ -13,6 +13,9 @@ export interface AppConfig {
   customLogoUrl?: string;
   uiMode: 'normal' | 'air-touch';        // Navigation/gesture mode
   monitorOrientation: 'horizontal' | 'vertical'; // Screen orientation mode
+  backendUrl?: string;
+  apiKey?: string;
+  kioskId?: string;
 }
 
 export type GridLayoutId = '1x1' | '2x1' | '3x1' | '4x1' | '2x2' | '2x3' | '3x3';

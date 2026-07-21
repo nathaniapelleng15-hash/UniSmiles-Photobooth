@@ -1,130 +1,58 @@
 import { StickerIcon, AppConfig, STORAGE_KEYS, DEFAULT_PASSWORD, FrameLayout, PhotoFilter, VirtualBackground, GridLayoutId, FrameStyle, FrameBackground } from '../types';
 
 // --- CONFIGURATION ---
-
-// Ganti URL ini dengan URL Web App Google Apps Script Anda nanti
-// Format: https://script.google.com/macros/s/......./exec
-export const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxcSs47NFiYCG7t0FiKbwfxvBg_D_48mzkWN8v_1HNYx-lDx87UyOsvbpsFHgEO7Ko6/exec"; 
-
-const UPLOAD_API_URL = "https://repofoto.kolab.top";
-const LOCAL_API_URL = "https://unismiles-photobooth-production.up.railway.app";
-const API_KEY = "Kolab@2311";
+// Mendapatkan URL Backend API secara dinamis dari config localStorage (agar langsung terupdate jika diubah di UI Settings)
+export const getApiBaseUrl = (): string => {
+  const stored = localStorage.getItem(STORAGE_KEYS.CONFIG);
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored);
+      if (parsed.backendUrl) return parsed.backendUrl;
+    } catch (_) {}
+  }
+  return import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+};
 
 // --- API HELPER FUNCTIONS ---
 
+/**
+ * Upload aset (sticker/overlay image) ke backend.
+ * Catatan: Saat ini menggunakan endpoint uploads backend lokal.
+ * Saat hosting, endpoint ini akan diarahkan ke CDN.
+ */
 export const uploadAsset = async (file: File): Promise<string | null> => {
   const timestamp = Date.now();
   const ext = file.name.split('.').pop();
   const filename = `aset-${timestamp}.${ext}`;
-  
+  const baseUrl = getApiBaseUrl();
+
   const formData = new FormData();
-  // Create a new file object with the specific timestamp name
   const renamedFile = new File([file], filename, { type: file.type });
-  formData.append('file', renamedFile);
+  formData.append('photo', renamedFile);
+  // session_id dummy untuk aset non-sesi
+  formData.append('session_id', `ASSET-${timestamp}`);
 
   try {
-    const response = await fetch(UPLOAD_API_URL, {
+    const response = await fetch(`${baseUrl}/api/photos`, {
       method: 'POST',
-      headers: {
-        'X-Api-Key': API_KEY,
-      },
       body: formData
     });
 
     if (response.ok) {
-      // Assuming the server puts files in /foto/ directory based on previous prompts
-      // If the API returns the full URL JSON, adapt here. 
-      // Based on description, we construct the URL:
-      return `https://repofoto.kolab.top/foto/${filename}`;
+      const data = await response.json();
+      // Backend mengembalikan URL relatif, jadikan absolut
+      const url = data.data?.url;
+      if (url) {
+        return url.startsWith('http') ? url : `${baseUrl}${url}`;
+      }
+      return `${baseUrl}/uploads/${filename}`;
     } else {
-      console.error("Upload failed", response.statusText);
+      console.error('Upload aset gagal:', response.statusText);
       return null;
     }
   } catch (error) {
-    console.error("Upload error", error);
+    console.error('Error upload aset:', error);
     return null;
-  }
-};
-
-export const syncFromCloud = async (): Promise<boolean> => {
-  if (!GOOGLE_SCRIPT_URL) return false;
-  
-  try {
-    const response = await fetch(`${GOOGLE_SCRIPT_URL}?action=getAll`);
-    if (!response.ok) throw new Error("Network response was not ok");
-    
-    const data = await response.json();
-    
-    if (data.config) {
-        // --- LOGIC PERUBAHAN: Strict Local Isolation ---
-        // Kita ambil config yang ada di local sekarang
-        const currentLocalConfig = getAppConfig();
-        
-        // Strategi Merge:
-        // 1. Password diambil dari CLOUD (jika ada).
-        // 2. Setting UI (Subtitle, Logo, UI Mode) DIPERTAHANKAN dari LOCAL.
-        const mergedConfig: AppConfig = {
-            password: data.config.password || currentLocalConfig.password,
-            customSubtitle: currentLocalConfig.customSubtitle,
-            customLogoUrl: currentLocalConfig.customLogoUrl,
-            uiMode: currentLocalConfig.uiMode,
-            monitorOrientation: currentLocalConfig.monitorOrientation
-        };
-        
-        localStorage.setItem(STORAGE_KEYS.CONFIG, JSON.stringify(mergedConfig));
-    }
-
-    if (data.icons) localStorage.setItem(STORAGE_KEYS.ICONS, JSON.stringify(data.icons));
-    if (data.frames) localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(data.frames));
-    if (data.filters) localStorage.setItem(STORAGE_KEYS.FILTERS, JSON.stringify(data.filters));
-    if (data.backgrounds) localStorage.setItem(STORAGE_KEYS.BACKGROUNDS, JSON.stringify(data.backgrounds));
-    
-    return true;
-  } catch (error) {
-    console.error("Failed to sync from cloud", error);
-    return false;
-  }
-};
-
-export const syncToCloud = async (): Promise<boolean> => {
-  if (!GOOGLE_SCRIPT_URL) {
-      alert("Google Script URL not configured in storageService.ts");
-      return false;
-  }
-
-  // --- LOGIC PERUBAHAN: Config Sanitization ---
-  // Kita hanya mengirim PASSWORD ke cloud.
-  // Setting UI (Subtitle, Logo, UI Mode) TIDAK DIKIRIM ke cloud.
-  const currentConfig = getAppConfig();
-  const configToSync = {
-      password: currentConfig.password
-      // customSubtitle, customLogoUrl, uiMode TIDAK dimasukkan disini.
-  };
-
-  const payload = {
-    action: 'saveAll',
-    data: {
-      config: configToSync, 
-      icons: getStoredIcons(),
-      frames: getStoredFrames(),
-      filters: getStoredFilters(),
-      backgrounds: getStoredBackgrounds()
-    }
-  };
-
-  try {
-    // We use no-cors or standard POST depending on GAS setup. 
-    // Usually 'text/plain' body avoids CORS preflight issues with simple GAS Web Apps.
-    const response = await fetch(GOOGLE_SCRIPT_URL, {
-      method: 'POST',
-      body: JSON.stringify(payload)
-    });
-    
-    // Note: Opaque response in no-cors mode, but we assume success if no network error
-    return true;
-  } catch (error) {
-    console.error("Failed to save to cloud", error);
-    return false;
   }
 };
 
@@ -135,32 +63,37 @@ export const getAppConfig = (): AppConfig => {
   if (stored) {
     try {
       const parsed = JSON.parse(stored);
-      // Ensure defaults if fields are missing in stored data
       return {
           password: parsed.password || DEFAULT_PASSWORD,
           customSubtitle: parsed.customSubtitle || '',
           customLogoUrl: parsed.customLogoUrl || '',
           uiMode: parsed.uiMode || 'normal',
-          monitorOrientation: parsed.monitorOrientation || 'horizontal'
+          monitorOrientation: parsed.monitorOrientation || 'horizontal',
+          backendUrl: parsed.backendUrl || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
+          apiKey: parsed.apiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
+          kioskId: parsed.kioskId || import.meta.env.VITE_KIOSK_ID || 'K-001'
       };
     } catch (e) {
-      console.error("Error parsing config", e);
+      console.error('Error parsing config', e);
     }
   }
-  const defaultConfig: AppConfig = { 
+  const defaultConfig: AppConfig = {
       password: DEFAULT_PASSWORD,
       customSubtitle: '',
       customLogoUrl: '',
       uiMode: 'normal',
-      monitorOrientation: 'horizontal'
+      monitorOrientation: 'horizontal',
+      backendUrl: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
+      apiKey: import.meta.env.VITE_KIOSK_API_KEY || '',
+      kioskId: import.meta.env.VITE_KIOSK_ID || 'K-001'
   };
-  saveAppConfig(defaultConfig, false); // Don't sync on init default
+  saveAppConfig(defaultConfig);
   return defaultConfig;
 };
 
-export const saveAppConfig = (config: AppConfig, sync = true): void => {
+export const saveAppConfig = (config: AppConfig): void => {
+  // Config kiosk (password, subtitle, logo, UI mode, backend api settings) disimpan di localStorage
   localStorage.setItem(STORAGE_KEYS.CONFIG, JSON.stringify(config));
-  if (sync) syncToCloud();
 };
 
 // --- Icons ---
@@ -172,35 +105,34 @@ export const getStoredIcons = (): StickerIcon[] => {
       const parsed = JSON.parse(stored);
       if (Array.isArray(parsed) && parsed.length > 0) return parsed;
     } catch (e) {
-      console.error("Error parsing stored icons, resetting to defaults", e);
+      console.error('Error parsing stored icons, resetting to defaults', e);
       localStorage.removeItem(STORAGE_KEYS.ICONS);
     }
   }
   return seedOpenMojiIcons();
 };
 
-export const saveStoredIcons = (icons: StickerIcon[], sync = true): void => {
+export const saveStoredIcons = (icons: StickerIcon[]): void => {
   try {
     localStorage.setItem(STORAGE_KEYS.ICONS, JSON.stringify(icons));
-    if (sync) syncToCloud();
   } catch (error) {
-    console.error("Storage limit reached", error);
-    alert("Storage limit reached! Please delete some assets.");
+    console.error('Storage limit reached', error);
+    alert('Storage limit reached! Please delete some assets.');
   }
 };
 
-const OPENMOJI_BASE_URL = "https://openmoji.org/data/color/svg";
+const OPENMOJI_BASE_URL = 'https://openmoji.org/data/color/svg';
 const EMOJI_HEX_CODES = [
-  "1F600", "1F603", "1F604", "1F601", "1F606", "1F605", "1F923", "1F602", "1F642", "1F643",
-  "1F609", "1F60A", "1F607", "1F970", "1F60D", "1F929", "1F618", "1F617", "1F60B", "1F61B",
-  "1F61C", "1F92A", "1F61D", "1F911", "1F917", "1F92D", "1F92B", "1F914", "1F910", "1F928",
-  "1F610", "1F611", "1F636", "1F60F", "1F612", "1F644", "1F62C", "1F925", "1F60C", "1F614",
-  "1F62A", "1F924", "1F634", "1F637", "1F912", "1F915", "1F922", "1F92E", "1F927", "1F975",
-  "1F976", "1F974", "1F635", "1F92F", "1F920", "1F973", "1F60E", "1F913", "1F9D0", "1F615",
-  "1F61F", "1F641", "1F62E", "1F62F", "1F632", "1F633", "1F97A", "1F626", "1F627", "1F628",
-  "1F625", "1F622", "1F62D", "1F631", "1F616", "1F623", "1F61E", "1F613", "1F629", "1F62B",
-  "1F971", "1F624", "1F621", "1F620", "1F92C", "1F608", "1F47F", "1F480", "2620", "1F479",
-  "1F47A", "1F47B", "1F47D", "1F47E", "1F916", "1F435", "1F412", "1F436", "1F431", "1F981"
+  '1F600', '1F603', '1F604', '1F601', '1F606', '1F605', '1F923', '1F602', '1F642', '1F643',
+  '1F609', '1F60A', '1F607', '1F970', '1F60D', '1F929', '1F618', '1F617', '1F60B', '1F61B',
+  '1F61C', '1F92A', '1F61D', '1F911', '1F917', '1F92D', '1F92B', '1F914', '1F910', '1F928',
+  '1F610', '1F611', '1F636', '1F60F', '1F612', '1F644', '1F62C', '1F925', '1F60C', '1F614',
+  '1F62A', '1F924', '1F634', '1F637', '1F912', '1F915', '1F922', '1F92E', '1F927', '1F975',
+  '1F976', '1F974', '1F635', '1F92F', '1F920', '1F973', '1F60E', '1F913', '1F9D0', '1F615',
+  '1F61F', '1F641', '1F62E', '1F62F', '1F632', '1F633', '1F97A', '1F626', '1F627', '1F628',
+  '1F625', '1F622', '1F62D', '1F631', '1F616', '1F623', '1F61E', '1F613', '1F629', '1F62B',
+  '1F971', '1F624', '1F621', '1F620', '1F92C', '1F608', '1F47F', '1F480', '2620', '1F479',
+  '1F47A', '1F47B', '1F47D', '1F47E', '1F916', '1F435', '1F412', '1F436', '1F431', '1F981'
 ];
 
 export const seedOpenMojiIcons = (): StickerIcon[] => {
@@ -213,14 +145,14 @@ export const seedOpenMojiIcons = (): StickerIcon[] => {
   } catch (e) {
       // ignore
   }
-  
+
   const initialIcons: StickerIcon[] = EMOJI_HEX_CODES.map((hex) => ({
     id: crypto.randomUUID(),
     name: `OpenMoji ${hex}`,
     url: `${OPENMOJI_BASE_URL}/${hex.toUpperCase()}.svg`,
     source: 'openmoji'
   }));
-  saveStoredIcons(initialIcons, false);
+  saveStoredIcons(initialIcons);
   return initialIcons;
 };
 
@@ -232,7 +164,7 @@ export const getLayoutConfig = (id: string) => {
             return {
                 width: 1200, height: 1800,
                 slots: [
-                    { x: 60, y: 60, width: 1080, height: 1340 } 
+                    { x: 60, y: 60, width: 1080, height: 1340 }
                 ]
             };
         case '2x1': // Photo Strip: 600 x 1700 px
@@ -297,16 +229,16 @@ export const getLayoutConfig = (id: string) => {
 
 const createDefaultStyles = (gridId: string): FrameStyle[] => {
     const defaults: Partial<FrameStyle>[] = [
-        { 
-            name: 'Classic White', 
+        {
+            name: 'Classic White',
             backgroundConfig: { type: 'solid', color: '#ffffff' },
             elements: []
         },
-        { 
-            name: 'Neon Night', 
-            backgroundConfig: { 
-                type: 'gradient', 
-                gradientType: 'linear', 
+        {
+            name: 'Neon Night',
+            backgroundConfig: {
+                type: 'gradient',
+                gradientType: 'linear',
                 gradientAngle: 45,
                 gradientStops: [{color: '#ff00cc', offset: 0}, {color: '#333399', offset: 100}]
             },
@@ -315,11 +247,11 @@ const createDefaultStyles = (gridId: string): FrameStyle[] => {
                 fontFamily: 'Neon', fontSize: 60, color: '#ff00ff', effect: 'neon', fontWeight: 'bold'
             }]
         },
-        { 
-            name: 'Sunny Day', 
-            backgroundConfig: { 
-                type: 'gradient', 
-                gradientType: 'radial', 
+        {
+            name: 'Sunny Day',
+            backgroundConfig: {
+                type: 'gradient',
+                gradientType: 'radial',
                 gradientStops: [{color: '#ffffcc', offset: 0}, {color: '#ff9966', offset: 100}]
             },
             elements: []
@@ -343,7 +275,7 @@ export const getStoredFrames = (): FrameLayout[] => {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
     } catch (e) {
-        console.error("Error parsing stored frames", e);
+        console.error('Error parsing stored frames', e);
         localStorage.removeItem(STORAGE_KEYS.FRAMES);
     }
   }
@@ -357,16 +289,14 @@ export const getStoredFrames = (): FrameLayout[] => {
     { id: '2x3', label: 'Grid 2x3 (900x1500)', enabled: true, price: 25000, styles: createDefaultStyles('2x3') },
     { id: '3x3', label: 'Grid 3x3 (1285x1900)', enabled: true, price: 30000, styles: createDefaultStyles('3x3') },
   ];
-  saveStoredFrames(defaultFrames, false);
+  saveStoredFrames(defaultFrames);
   return defaultFrames;
 };
 
-export const saveStoredFrames = (frames: FrameLayout[], sync = true): void => {
+export const saveStoredFrames = (frames: FrameLayout[]): void => {
   localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(frames));
-  if (sync) {
-    syncToCloud();
-    syncFramesToDatabase(frames);
-  }
+  // Sync ke backend secara background (non-blocking)
+  syncFramesToDatabase(frames).catch(e => console.warn('Background frame sync gagal:', e));
 };
 
 // --- Filters ---
@@ -377,7 +307,7 @@ export const getStoredFilters = (): PhotoFilter[] => {
     try {
         return JSON.parse(stored);
     } catch(e) {
-        console.error("Error parsing filters", e);
+        console.error('Error parsing filters', e);
     }
   }
   return seedDefaultFilters();
@@ -407,16 +337,14 @@ export const seedDefaultFilters = (): PhotoFilter[] => {
     { id: 'amaro', name: 'Amaro', cssFilter: 'hue-rotate(-10deg) contrast(90%) brightness(110%) saturate(150%)', enabled: true },
     { id: 'mayfair', name: 'Mayfair', cssFilter: 'contrast(110%) saturate(110%)', enabled: true }
   ];
-  saveStoredFilters(defaultFilters, false);
+  saveStoredFilters(defaultFilters);
   return defaultFilters;
 };
 
-export const saveStoredFilters = (filters: PhotoFilter[], sync = true): void => {
+export const saveStoredFilters = (filters: PhotoFilter[]): void => {
   localStorage.setItem(STORAGE_KEYS.FILTERS, JSON.stringify(filters));
-  if (sync) {
-    syncToCloud();
-    syncFiltersToDatabase(filters);
-  }
+  // Sync ke backend secara background (non-blocking)
+  syncFiltersToDatabase(filters).catch(e => console.warn('Background filter sync gagal:', e));
 };
 
 // --- Backgrounds ---
@@ -427,49 +355,85 @@ export const getStoredBackgrounds = (): VirtualBackground[] => {
     try {
         return JSON.parse(stored);
     } catch(e) {
-        console.error("Error parsing backgrounds", e);
+        console.error('Error parsing backgrounds', e);
     }
   }
   return seedDefaultBackgrounds();
 };
 
 export const seedDefaultBackgrounds = (): VirtualBackground[] => {
-    // User requested no hardcoded defaults for backgrounds.
-    // The source of truth is the Cloud Sheet.
-    return [];
+  return [];
 };
 
-export const saveStoredBackgrounds = (bgs: VirtualBackground[], sync = true): void => {
+export const saveStoredBackgrounds = (bgs: VirtualBackground[]): void => {
   localStorage.setItem(STORAGE_KEYS.BACKGROUNDS, JSON.stringify(bgs));
-  if (sync) syncToCloud();
 };
 
-// --- MySQL DB Syncing Helpers ---
+// --- Backend Syncing Helpers ---
 
+/**
+ * Sync frame layouts ke backend sebagai frame_templates.
+ * Setiap style dalam setiap layout dikirim sebagai satu frame template.
+ */
 export const syncFramesToDatabase = async (frames: FrameLayout[]): Promise<boolean> => {
+  const baseUrl = getApiBaseUrl();
   try {
-    const res = await fetch(`${LOCAL_API_URL}/api/frames`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ frames })
-    });
-    return res.ok;
+    // Kirim setiap style sebagai individual frame template
+    const promises = frames.flatMap(layout =>
+      layout.styles.map(style =>
+        fetch(`${baseUrl}/api/frame_templates`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: `${layout.label} — ${style.name}`,
+            category: layout.id,
+            image_url: style.overlayUrl || style.previewUrl || '',
+            slot_count: layout.styles.length,
+            layout_config: {
+              layout_id: layout.id,
+              layout_label: layout.label,
+              layout_price: layout.price,
+              layout_enabled: layout.enabled,
+              style_id: style.id,
+              backgroundConfig: style.backgroundConfig,
+              elements: style.elements,
+              previewUrl: style.previewUrl,
+              overlayUrl: style.overlayUrl
+            }
+          })
+        }).catch(() => null) // Jangan crash jika satu gagal
+      )
+    );
+    await Promise.allSettled(promises);
+    return true;
   } catch (e) {
-    console.error("Failed to sync frames to MySQL database", e);
+    console.error('Gagal sync frames ke backend:', e);
     return false;
   }
 };
 
+/**
+ * Sync filters ke backend.
+ * Format backend: { name, css_filter, is_active }
+ */
 export const syncFiltersToDatabase = async (filters: PhotoFilter[]): Promise<boolean> => {
+  const baseUrl = getApiBaseUrl();
   try {
-    const res = await fetch(`${LOCAL_API_URL}/api/filters`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filters })
-    });
-    return res.ok;
+    const promises = filters.map(filter =>
+      fetch(`${baseUrl}/api/filters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: filter.name,
+          css_filter: filter.cssFilter,
+          is_active: filter.enabled ? 1 : 0
+        })
+      }).catch(() => null)
+    );
+    await Promise.allSettled(promises);
+    return true;
   } catch (e) {
-    console.error("Failed to sync filters to MySQL database", e);
+    console.error('Gagal sync filters ke backend:', e);
     return false;
   }
 };
@@ -482,75 +446,91 @@ export const syncToDatabase = async (): Promise<boolean> => {
   return framesSuccess && filtersSuccess;
 };
 
+/**
+ * Sync data dari Backend API Server ke localStorage kiosk.
+ * Filters: diambil penuh dari backend (format baru: css_filter field).
+ * Frames: hanya diambil jika localStorage kosong (format backend lebih sederhana).
+ */
 export const syncFromDatabase = async (): Promise<boolean> => {
+  const baseUrl = getApiBaseUrl();
   try {
-    // 1. Fetch frames
-    const framesRes = await fetch(`${LOCAL_API_URL}/api/frames`);
+    // 1. Fetch filters dari backend
+    // Format response baru: { success, count, data: [{ id, name, css_filter, is_active }] }
+    const filtersRes = await fetch(`${baseUrl}/api/filters`);
+    let hasFiltersData = false;
+    if (filtersRes.ok) {
+      const data = await filtersRes.json();
+      if (data.success && data.data && data.data.length > 0) {
+        hasFiltersData = true;
+        const dbFilters: PhotoFilter[] = data.data.map((row: any) => ({
+          id: String(row.id),
+          name: row.name,
+          cssFilter: row.css_filter,
+          enabled: !!row.is_active
+        }));
+        localStorage.setItem(STORAGE_KEYS.FILTERS, JSON.stringify(dbFilters));
+        console.log(`✅ ${dbFilters.length} filter berhasil diambil dari backend`);
+      }
+    }
+
+    // 2. Fetch frame templates dari backend
+    // Format response baru: { success, count, data: [{ id, name, category, image_url, slot_count, layout_config }] }
+    const framesRes = await fetch(`${baseUrl}/api/frame_templates`);
     let hasFramesData = false;
     if (framesRes.ok) {
       const data = await framesRes.json();
-      if (data.success && data.frames && data.frames.length > 0) {
+      if (data.success && data.data && data.data.length > 0) {
         hasFramesData = true;
-        const dbFrames = data.frames;
-        
-        // Group by layout_id
-        const layoutsMap = new Map<string, any>();
-        
-        for (const row of dbFrames) {
-          const config = JSON.parse(row.layout_config);
-          const layoutId = config.layout_id;
-          
+        // Rekonstruksi FrameLayout dari data backend
+        // layout_config berisi data lengkap yang disimpan saat syncFramesToDatabase
+        const layoutsMap = new Map<string, FrameLayout>();
+
+        for (const row of data.data) {
+          const config = typeof row.layout_config === 'string'
+            ? JSON.parse(row.layout_config)
+            : row.layout_config;
+
+          const layoutId = config.layout_id || row.category || 'unknown';
+
           if (!layoutsMap.has(layoutId)) {
             layoutsMap.set(layoutId, {
               id: layoutId,
               label: config.layout_label || `${layoutId} Layout`,
-              enabled: config.layout_enabled !== undefined ? !!config.layout_enabled : !!row.is_active,
-              price: config.layout_price !== undefined ? Number(config.layout_price) : 45000,
+              enabled: config.layout_enabled !== undefined ? !!config.layout_enabled : true,
+              price: config.layout_price !== undefined ? Number(config.layout_price) : 20000,
               styles: []
             });
           }
-          
-          layoutsMap.get(layoutId).styles.push({
-            id: config.style_id || row.id.toString(),
-            name: row.name,
-            backgroundConfig: config.backgroundConfig,
+
+          layoutsMap.get(layoutId)!.styles.push({
+            id: config.style_id || String(row.id),
+            name: row.name.replace(`${config.layout_label} — `, ''),
+            backgroundConfig: config.backgroundConfig || { type: 'solid', color: '#ffffff' },
             elements: config.elements || [],
             previewUrl: config.previewUrl || '',
             overlayUrl: config.overlayUrl || ''
           });
         }
-        
+
         const frameLayouts = Array.from(layoutsMap.values());
         localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(frameLayouts));
+        console.log(`✅ ${frameLayouts.length} layout frame berhasil diambil dari backend`);
       }
     }
 
-    // 2. Fetch filters
-    let hasFiltersData = false;
-    const filtersRes = await fetch(`${LOCAL_API_URL}/api/filters`);
-    if (filtersRes.ok) {
-      const data = await filtersRes.json();
-      if (data.success && data.filters && data.filters.length > 0) {
-        hasFiltersData = true;
-        const dbFilters = data.filters.map((row: any) => ({
-          id: row.type,
-          name: row.name,
-          cssFilter: row.preview_url,
-          enabled: !!row.is_active
-        }));
-        localStorage.setItem(STORAGE_KEYS.FILTERS, JSON.stringify(dbFilters));
-      }
+    // Auto-seed default data ke backend jika masih kosong (pertama kali setup)
+    if (!hasFiltersData) {
+      console.log('📦 Backend kosong, seeding default filters...');
+      await syncFiltersToDatabase(getStoredFilters());
+    }
+    if (!hasFramesData) {
+      console.log('📦 Backend kosong, seeding default frames...');
+      await syncFramesToDatabase(getStoredFrames());
     }
 
-    // Jika database kosong (pertama kali dijalankan), lakukan auto-seeding
-    if (!hasFramesData || !hasFiltersData) {
-      console.log("Seeding default frames/filters to MySQL database...");
-      await syncToDatabase();
-    }
-    
     return true;
   } catch (error) {
-    console.error("Failed to sync from local database", error);
+    console.error('Gagal sync dari backend:', error);
     return false;
   }
 };

@@ -7,6 +7,7 @@ import {
 import { FrameLayout, FrameStyle, PhotoFilter, GridLayoutId, VirtualBackground, FrameElement } from '../types';
 import { getStoredFrames, getStoredFilters, getLayoutConfig, getStoredBackgrounds, getAppConfig } from '../services/storageService';
 import { useAirGesture } from './useAirGesture';
+import { startSession, completeSession, uploadPhoto, sendPhotoByEmail } from '../services/apiService';
 
 // Global Scale (Now 1.0 since we removed transform scale from index.html)
 const GLOBAL_SCALE = 1.0;
@@ -15,17 +16,11 @@ const GLOBAL_SCALE = 1.0;
 const SHUTTER_SOUND_URL = "https://assets.mixkit.co/active_storage/sfx/2578/2578-preview.mp3";
 const COUNTDOWN_SOUND_URL = "https://cdn.pixabay.com/download/audio/2022/03/24/audio_cda640386c.mp3?filename=beep-6-96243.mp3";
 
-// API — Production backend (Railway)
-const API_BASE_URL = "https://unismiles-photobooth-production.up.railway.app";
-const UPLOAD_API_URL = `${API_BASE_URL}/api/photos/upload`;
-const BASE_RESULT_URL = `${API_BASE_URL}/uploads/`;
-// API_KEY tidak diperlukan lagi (server lokal)
-
 interface PhotoBoothProps {
   onAdminClick: () => void;
 }
 
-type BoothStep = 'LANDING' | 'LAYOUT' | 'PAYMENT' | 'CAPTURE' | 'EDIT' | 'RESULT';
+type BoothStep = 'LANDING' | 'PACKAGE' | 'LAYOUT' | 'PAYMENT' | 'CAPTURE' | 'EDIT' | 'RESULT';
 
 // --- OPTIMIZATION: Global Image Cache ---
 // Stores URL -> Base64 mapping to prevent re-fetching same assets
@@ -169,19 +164,23 @@ const BoothWrapper: React.FC<BoothWrapperProps> = ({ children, title, subtitle, 
           </div>
       )}
 
-      {/* Absolute Back Button if onBack is provided */}
-      {onBack && (
-         <div className={`absolute z-50 ${isVertical ? 'top-3 left-3' : 'top-6 left-6'}`}>
-             <button onClick={onBack} className="active:scale-95 hover:scale-110 transition-all outline-none">
-                 <img src="/assets/BACK.png" alt="Back" className={`object-contain drop-shadow-md ${isVertical ? 'h-12' : 'h-20 md:h-24'}`} />
-             </button>
-         </div>
-      )}
-
       {!hideHeader && (
         <div className={`px-6 w-full flex justify-center relative items-center bg-white/10 backdrop-blur-md border-b border-white/10 shrink-0 z-10 ${uiMode === 'air-touch' ? 'py-8' : isVertical ? 'py-3' : 'py-5'}`}>
-            {/* Title - Centered */}
-            <div className="text-center pointer-events-none">
+            {/* Header actions are absolutely positioned so the title stays centered in the viewport. */}
+            {onBack && (
+                <div className={`absolute left-3 top-1/2 -translate-y-1/2 z-20 ${isVertical ? '' : 'md:left-6'}`}>
+                    <button
+                        onClick={onBack}
+                        className="flex items-center justify-center rounded-full p-1 active:scale-95 hover:scale-105 transition-transform outline-none"
+                        aria-label="Back"
+                    >
+                        <img src="/assets/BACK.png" alt="" className={`object-contain ${isVertical ? 'h-12' : 'h-20 md:h-24'}`} />
+                    </button>
+                </div>
+            )}
+
+            {/* This remains in normal flow, independently centered from Back and settings actions. */}
+            <div className="max-w-[62vw] text-center pointer-events-none">
                 {title && <h2 className={`font-display font-bold tracking-tight leading-none drop-shadow-lg ${uiMode === 'air-touch' ? 'text-4xl' : isVertical ? 'text-xl' : 'text-3xl md:text-4xl'}`}>{title}</h2>}
                 {subtitle && <p className={`text-white/90 mt-1 drop-shadow-md ${uiMode === 'air-touch' ? 'text-xl' : isVertical ? 'text-xs' : 'text-base md:text-lg'}`}>{subtitle}</p>}
             </div>
@@ -297,6 +296,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [monitorOrientation, setMonitorOrientation] = useState<'horizontal' | 'vertical'>('horizontal');
 
   // State
+  const [selectedPackage, setSelectedPackage] = useState<'print' | 'digital' | null>(null);
   const [selectedLayoutId, setSelectedLayoutId] = useState<GridLayoutId | null>(null);
   const [capturedPhotos, setCapturedPhotos] = useState<string[]>([]);
   const [selectedFilter, setSelectedFilter] = useState<PhotoFilter | null>(null);
@@ -802,31 +802,40 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   // --- Actions ---
   const handleStart = () => {
       // Ensure state is clear when starting fresh
+      setSelectedPackage(null);
       setCapturedPhotos([]);
       setFinalUploadedUrl(null);
       setProcessedFrame(null);
+      setStep('PACKAGE');
+  };
+  const handlePackageSelect = (pkg: 'print' | 'digital') => {
+      setSelectedPackage(pkg);
       setStep('LAYOUT');
   };
-  const handleLayoutSelect = (id: GridLayoutId) => { 
+  const handleLayoutSelect = async (id: GridLayoutId) => { 
     setSelectedLayoutId(id); 
     setCapturedPhotos([]); 
     setIsAutoCapturing(false); 
-    setResultTimestamp(Date.now().toString());
+    
+    const timestamp = Date.now().toString();
+    setResultTimestamp(timestamp);
+    
+    // Mulai session di database backend (dummy Kiosk ID default "K-001")
+    const kioskId = import.meta.env.VITE_KIOSK_ID || 'K-001';
+    startSession(kioskId, null).catch(err => console.warn('⚠️ Gagal daftarkan sesi ke DB:', err));
+    
     setStep('PAYMENT'); 
   };
   const handlePaymentConfirm = async () => {
     const price = frames.find(f => f.id === selectedLayoutId)?.price || 45000;
+    const sessionId = `#US-${resultTimestamp}`;
     try {
-      await fetch(`${API_BASE_URL}/api/transactions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: resultTimestamp,
-          layout_id: selectedLayoutId,
-          amount: price,
-          payment_method: 'QRIS',
-          status: 'success'
-        })
+      // Panggil API completeSession baru
+      await completeSession(sessionId, {
+        transaction_code: `TRX-${resultTimestamp}`,
+        amount: price,
+        payment_method: 'QRIS',
+        status: 'completed'
       });
     } catch (e) {
       console.error('Failed to log transaction:', e);
@@ -913,47 +922,18 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     setIsSending(true);
     setEmailError(null);
     try {
-      // Gunakan URL server jika sudah ada, kalau tidak generate dari canvas
-      let photoUrl = finalUploadedUrl;
-      let photoBase64: string | null = null;
+      const sessionId = `#US-${resultTimestamp}`;
+      // Panggil sendPhotoByEmail baru
+      const success = await sendPhotoByEmail(sessionId, email);
 
-      if (!photoUrl) {
-        // Generate gambar langsung dari canvas
-        const generated = await generateCompositeImage();
-        if (!generated) throw new Error('Gagal menghasilkan gambar. Coba lagi.');
-        photoBase64 = generated; // data:image/png;base64,...
-      }
-
-      const res = await fetch(`${API_BASE_URL}/api/email/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: email,
-          photoUrl: photoUrl || null,
-          photoBase64: photoBase64 || null,
-          sessionId: resultTimestamp,
-        }),
-      });
-
-      let errorMessage = 'Gagal kirim email';
-      if (res.ok) {
+      if (success) {
         setIsSent(true);
       } else {
-        try {
-          const data = await res.json();
-          errorMessage = data.error || errorMessage;
-        } catch (_) {
-          errorMessage = `Server merespon dengan status ${res.status}`;
-        }
-        throw new Error(errorMessage);
+        throw new Error('Gagal mengirim email. Silakan periksa koneksi internet kiosk.');
       }
     } catch (err: any) {
       console.error('Email send error:', err);
-      if (err.name === 'TypeError' || err.message.includes('fetch') || err.message.includes('Load failed')) {
-        setEmailError('Koneksi ke backend gagal. Pastikan backend Render Anda sudah aktif.');
-      } else {
-        setEmailError(err.message || 'Terjadi kesalahan. Coba lagi.');
-      }
+      setEmailError(err.message || 'Terjadi kesalahan saat mengirim email. Coba lagi.');
     } finally {
       setIsSending(false);
     }
@@ -1104,21 +1084,16 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           try {
               const res = await fetch(dataUrl);
               const blob = await res.blob();
-              const formData = new FormData();
-              formData.append('file', blob, `${resultTimestamp}.png`);
-              formData.append('session_id', resultTimestamp);
-              formData.append('layout_id', selectedLayoutId || '');
-
-              const uploadRes = await fetch(UPLOAD_API_URL, { 
-                  method: 'POST', 
-                  body: formData,
-                  signal: AbortSignal.timeout(10000) // timeout 10 detik
-              });
+              const sessionId = `#US-${resultTimestamp}`;
               
-              if (uploadRes.ok) {
-                  const serverUrl = `${BASE_RESULT_URL}${resultTimestamp}.png`;
+              // Upload foto menggunakan apiService
+              const serverUrl = await uploadPhoto(blob, sessionId, `${resultTimestamp}.png`);
+              
+              if (serverUrl) {
                   setFinalUploadedUrl(serverUrl);
                   console.log('✅ Foto berhasil diupload ke server:', serverUrl);
+              } else {
+                  throw new Error('Upload gagal');
               }
           } catch (uploadErr) {
               // Backend tidak tersedia — pakai base64 lokal (sudah di-set di atas)
@@ -1464,8 +1439,31 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         </>
       )}
 
+      {step === 'PACKAGE' && (
+        <BoothWrapper title="Choose Package" subtitle="Select your preferred output" onAdminClick={onAdminClick} isLocked={isCursorLocked} onToggleLock={() => setIsCursorLocked(!isCursorLocked)} uiMode={uiMode} onBack={() => setStep('LANDING')} isVertical={isVertical}>
+            <div className={`h-full flex flex-col items-center justify-center ${isVertical ? 'p-4 gap-6' : 'p-10 gap-10'}`}>
+                <button 
+                    onClick={() => handlePackageSelect('print')}
+                    className="w-full max-w-md bg-[#f6cd46] hover:bg-[#e5bc35] text-black rounded-3xl p-8 flex flex-col items-center justify-center gap-4 transition-all active:scale-95 shadow-xl hover:shadow-2xl border-4 border-transparent hover:border-white/50"
+                >
+                    <Printer size={64} />
+                    <h3 className="text-3xl font-black">Print + Digital</h3>
+                    <p className="text-center font-medium opacity-80">Get a physical copy and digital download</p>
+                </button>
+                <button 
+                    onClick={() => handlePackageSelect('digital')}
+                    className="w-full max-w-md bg-white/10 hover:bg-white/20 text-white rounded-3xl p-8 flex flex-col items-center justify-center gap-4 transition-all active:scale-95 shadow-xl hover:shadow-2xl border border-white/20"
+                >
+                    <Download size={64} />
+                    <h3 className="text-3xl font-black">Digital Only</h3>
+                    <p className="text-center text-white/70">Softcopy only, sent to your email or phone</p>
+                </button>
+            </div>
+        </BoothWrapper>
+      )}
+
       {step === 'LAYOUT' && (
-        <BoothWrapper title="Choose Layout" subtitle="Tap to select your format" onAdminClick={onAdminClick} isLocked={isCursorLocked} onToggleLock={() => setIsCursorLocked(!isCursorLocked)} uiMode={uiMode} onBack={() => setStep('LANDING')} isVertical={isVertical}>
+        <BoothWrapper title="Choose Layout" subtitle="Tap to select your format" onAdminClick={onAdminClick} isLocked={isCursorLocked} onToggleLock={() => setIsCursorLocked(!isCursorLocked)} uiMode={uiMode} onBack={() => setStep('PACKAGE')} isVertical={isVertical}>
             <div className={`h-full flex flex-col ${isVertical ? 'p-4' : isAirTouch ? 'p-10' : 'p-6 md:p-10'}`}>
                 <div className="flex-1 overflow-y-auto flex items-center justify-center">
                     <div className={`flex flex-wrap justify-center items-center w-full mx-auto ${isVertical ? 'gap-3 max-w-xs pt-2 pb-4' : isAirTouch ? 'gap-10 md:gap-14 max-w-4xl' : 'gap-5 md:gap-8 max-w-4xl lg:max-w-5xl pb-6'}`}>
@@ -1784,6 +1782,16 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
 
                     {/* Action Buttons */}
                     <div className={`flex flex-wrap items-center justify-center gap-3 z-20 relative shrink-0 ${isVertical ? 'mt-2 pb-1' : 'mt-8'}`}>
+                        {selectedPackage === 'print' && (
+                            <button 
+                                id="btn-print"
+                                onClick={handlePrint}
+                                disabled={!areAssetsReady}
+                                className={`flex items-center gap-2 bg-[#ffffff] hover:bg-[#f0f0f0] text-black rounded-full shadow-[0_10px_20px_rgba(255,255,255,0.3)] transition-all active:scale-95 italic font-serif disabled:opacity-50 disabled:cursor-not-allowed ${isVertical ? 'px-8 py-2.5 text-base' : 'px-12 py-4 text-xl'}`}
+                            >
+                                <Printer size={isVertical ? 20 : 24} /> Print
+                            </button>
+                        )}
                         <button 
                             id="btn-email"
                             onClick={() => {
