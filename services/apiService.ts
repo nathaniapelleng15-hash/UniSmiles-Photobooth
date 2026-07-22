@@ -1,3 +1,5 @@
+import axios from 'axios';
+
 /**
  * apiService.ts
  * ─────────────────────────────────────────────────────────────────────────────
@@ -78,32 +80,14 @@ export interface PrintLogPayload {
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
-/**
- * Helper fetch dengan x-api-key header otomatis.
- * Digunakan untuk semua request yang butuh autentikasi kiosk.
- */
-const apiFetch = async (
-  endpoint: string,
-  options: RequestInit = {}
-): Promise<Response> => {
-  const config = getApiConfig();
-  const headers: Record<string, string> = {
-    'x-api-key': config.apiKey?.trim() || '',
-    ...(options.headers as Record<string, string> || {})
-  };
+export const apiClient = axios.create();
 
-  if (!config.apiKey) {
-    console.warn(
-      '[apiService] apiKey belum diisi di Kiosk Settings!\n' +
-      'Daftarkan kiosk ini di Admin Dashboard untuk mendapatkan API Key.'
-    );
-  }
-
-  return fetch(`${config.backendUrl}${endpoint}`, {
-    ...options,
-    headers
-  });
-};
+apiClient.interceptors.request.use((config) => {
+  const appConfig = getApiConfig();
+  config.baseURL = appConfig.backendUrl;
+  config.headers['x-api-key'] = appConfig.apiKey?.trim() || '';
+  return config;
+});
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 
@@ -114,8 +98,7 @@ const apiFetch = async (
 export const checkBackendHealth = async (url: string, currentApiKey: string): Promise<boolean> => {
   try {
     const targetUrl = url || getApiConfig().backendUrl;
-    const res = await fetch(`${targetUrl}/payments`, {
-      method: 'GET',
+    const res = await axios.get(`${targetUrl}/payments`, {
       headers: {
         'x-api-key': currentApiKey
       }
@@ -145,28 +128,22 @@ export const startSession = async (
   kioskId: string,
   frameTemplateId?: number | null
 ): Promise<SessionData | null> => {
-  const sessionId = `#US-${Date.now()}`;
-
   try {
-    const res = await apiFetch('/api/v1/kiosk/sessions/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        frame_template_id: frameTemplateId || null
-      })
+    const res = await apiClient.post<ApiResponse<SessionData>>('/sessions/start', {
+      frame_template_id: frameTemplateId || null
     });
 
-    const data: ApiResponse<SessionData> = await res.json();
+    const data = res.data;
 
-    if (res.ok && data.success && data.session_code) {
-      console.log(`🎬 Sesi dimulai: ${data.session_code}`);
-      return { id: data.session_code, kiosk_id: kioskId, status: 'active' } as SessionData;
+    if (data.success && (data as any).session_code) {
+      console.log(`🎬 Sesi dimulai: ${(data as any).session_code}`);
+      return { id: (data as any).session_code, kiosk_id: kioskId, status: 'active' } as SessionData;
     } else {
       console.error('Gagal memulai sesi:', data.message);
       return null;
     }
-  } catch (error) {
-    console.error('Error saat startSession:', error);
+  } catch (error: any) {
+    console.error('Error saat startSession:', error?.response?.data || error);
     return null;
   }
 };
@@ -176,28 +153,23 @@ export const startSession = async (
  * Dipanggil setelah pembayaran QRIS dikonfirmasi.
  *
  * @param sessionId   - ID sesi yang aktif
- * @param transaction - Data transaksi pembayaran
  */
 export const completeSession = async (
   sessionId: string
 ): Promise<boolean> => {
   try {
-    const res = await apiFetch(`/api/v1/kiosk/sessions/${encodeURIComponent(sessionId)}/complete`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' }
-    });
+    const res = await apiClient.put<ApiResponse>(`/sessions/${encodeURIComponent(sessionId)}/complete`);
+    const data = res.data;
 
-    const data: ApiResponse = await res.json();
-
-    if (res.ok && data.success) {
+    if (data.success) {
       console.log(`✅ Sesi ${sessionId} selesai`);
       return true;
     } else {
       console.error('Gagal menyelesaikan sesi:', data.message);
       return false;
     }
-  } catch (error) {
-    console.error('Error saat completeSession:', error);
+  } catch (error: any) {
+    console.error('Error saat completeSession:', error?.response?.data || error);
     return false;
   }
 };
@@ -223,33 +195,35 @@ export const uploadPhoto = async (
   const file = new File([photoBlob], finalName, { type: photoBlob.type || 'image/png' });
 
   const formData = new FormData();
-  formData.append('photo', file);      // ← field name 'photo' (bukan 'file')
+  formData.append('photo', file);
   formData.append('session_id', sessionId);
 
   try {
-    const res = await apiFetch(`/api/v1/kiosk/sessions/${encodeURIComponent(sessionId)}/photos`, {
-      method: 'POST',
-      body: formData
-    });
+    const res = await apiClient.post<ApiResponse<PhotoData>>(
+      `/sessions/${encodeURIComponent(sessionId)}/photos`,
+      formData
+    );
 
-    const data: ApiResponse<PhotoData> = await res.json();
+    const data = res.data;
 
-    if (res.ok && data.success) {
+    if (data.success) {
       const photoUrl = data.data?.url;
       if (!photoUrl) return null;
-      // Jadikan URL absolut jika backend mengembalikan path relatif
+      
       const config = getApiConfig();
+      const rootUrl = config.backendUrl.replace('/api/v1/kiosk', '');
       const absoluteUrl = photoUrl.startsWith('http')
         ? photoUrl
-        : `${config.backendUrl}${photoUrl}`;
+        : `${rootUrl}${photoUrl}`;
+      
       console.log(`📸 Foto terupload: ${absoluteUrl}`);
       return absoluteUrl;
     } else {
       console.error('Gagal upload foto:', data.message);
       return null;
     }
-  } catch (error) {
-    console.error('Error saat uploadPhoto:', error);
+  } catch (error: any) {
+    console.error('Error saat uploadPhoto:', error?.response?.data || error);
     return null;
   }
 };
@@ -260,44 +234,47 @@ export const getPhotosBySession = async (sessionId: string): Promise<PhotoData[]
 
 export const fetchTemplates = async (): Promise<any[]> => {
   try {
-    const res = await apiFetch('/api/v1/kiosk/templates');
-    const data = await res.json();
-    if (res.ok && data.success) {
+    const res = await apiClient.get('/templates');
+    const data = res.data;
+    if (data.success) {
       return data.data || [];
     }
     return [];
-  } catch (error) {
-    console.error('Error fetchTemplates:', error);
+  } catch (error: any) {
+    console.error('Error fetchTemplates:', error?.response?.data || error);
     return [];
   }
 };
 
 export const fetchPaymentProfile = async (): Promise<string | null> => {
   try {
-    const res = await apiFetch('/api/v1/kiosk/payments');
-    const data = await res.json();
-    if (res.ok && data.success && data.data && data.data.length > 0) {
-      const qrisData = JSON.parse(data.data[0].payment_data);
-      const url = qrisData.qris_image_url;
+    const response = await apiClient.get('/payments');
+    if (response.data.success && response.data.data && response.data.data.length > 0) {
+      const payment = response.data.data[0];
+      const paymentData = typeof payment.payment_data === 'string' 
+        ? JSON.parse(payment.payment_data) 
+        : payment.payment_data;
+      const qrisPath = paymentData?.qris_image_url;
+      
+      // Extract the root server URL (remove /api/v1/kiosk) to fetch the uploaded image
       const config = getApiConfig();
-      return url.startsWith('http') ? url : `${config.backendUrl}${url}`;
+      const rootUrl = config.backendUrl.replace('/api/v1/kiosk', '');
+      
+      return rootUrl + qrisPath;
     }
     return null;
-  } catch (error) {
-    console.error('Error getPaymentProfile:', error);
+  } catch (error: any) {
+    console.error('Error fetchPaymentProfile:', error?.response?.data || error);
     return null;
   }
 };
 
 export const verifyPayment = async (sessionId: string): Promise<boolean> => {
   try {
-    const res = await apiFetch(`/api/v1/kiosk/sessions/${encodeURIComponent(sessionId)}/payment`, {
-      method: 'POST'
-    });
-    const data = await res.json();
-    return res.ok && data.success;
-  } catch (error) {
-    console.error('Error verifyPayment:', error);
+    const res = await apiClient.post(`/sessions/${encodeURIComponent(sessionId)}/payment`);
+    return res.data.success;
+  } catch (error: any) {
+    console.error('Error verifyPayment:', error?.response?.data || error);
     return false;
   }
 };
@@ -316,26 +293,22 @@ export const sendPhotoByEmail = async (
   email: string
 ): Promise<boolean> => {
   try {
-    const res = await apiFetch(
-      `/api/sessions/${encodeURIComponent(sessionId)}/send-email`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email })
-      }
+    const res = await apiClient.post<ApiResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/send-email`,
+      { email }
     );
 
-    const data: ApiResponse = await res.json();
+    const data = res.data;
 
-    if (res.ok && data.success) {
+    if (data.success) {
       console.log(`📧 Email terkirim ke ${email}`);
       return true;
     } else {
       console.error('Gagal kirim email:', data.message);
       return false;
     }
-  } catch (error) {
-    console.error('Error saat sendPhotoByEmail:', error);
+  } catch (error: any) {
+    console.error('Error saat sendPhotoByEmail:', error?.response?.data || error);
     return false;
   }
 };
@@ -348,15 +321,10 @@ export const sendPhotoByEmail = async (
  */
 export const logGesture = async (payload: GesturePayload): Promise<boolean> => {
   try {
-    const res = await apiFetch('/api/gestures', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data: ApiResponse = await res.json();
-    return res.ok && data.success;
-  } catch (error) {
-    console.error('Error saat logGesture:', error);
+    const res = await apiClient.post<ApiResponse>('/gestures', payload);
+    return res.data.success;
+  } catch (error: any) {
+    console.error('Error saat logGesture:', error?.response?.data || error);
     return false;
   }
 };
@@ -367,15 +335,10 @@ export const logGesture = async (payload: GesturePayload): Promise<boolean> => {
  */
 export const recordPrintLog = async (payload: PrintLogPayload): Promise<boolean> => {
   try {
-    const res = await apiFetch('/api/prints', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data: ApiResponse = await res.json();
-    return res.ok && data.success;
-  } catch (error) {
-    console.error('Error saat recordPrintLog:', error);
+    const res = await apiClient.post<ApiResponse>('/prints', payload);
+    return res.data.success;
+  } catch (error: any) {
+    console.error('Error saat recordPrintLog:', error?.response?.data || error);
     return false;
   }
 };
@@ -387,13 +350,11 @@ export const recordPrintLog = async (payload: PrintLogPayload): Promise<boolean>
  * Dipanggil saat startup kiosk untuk sync data terbaru dari admin.
  */
 export const getFrameTemplates = async () => {
-  const config = getApiConfig();
   try {
-    const res = await fetch(`${config.backendUrl}/api/frame_templates`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch (error) {
-    console.error('Error saat getFrameTemplates:', error);
+    const res = await apiClient.get('/templates');
+    return res.data.success ? res.data.data : [];
+  } catch (error: any) {
+    console.error('Error saat getFrameTemplates:', error?.response?.data || error);
     return [];
   }
 };
@@ -403,13 +364,11 @@ export const getFrameTemplates = async () => {
  * Dipanggil saat startup kiosk untuk sync filter terbaru dari admin.
  */
 export const getFilters = async () => {
-  const config = getApiConfig();
   try {
-    const res = await fetch(`${config.backendUrl}/api/filters`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch (error) {
-    console.error('Error saat getFilters:', error);
+    const res = await apiClient.get('/filters');
+    return res.data.success ? res.data.data : [];
+  } catch (error: any) {
+    console.error('Error saat getFilters:', error?.response?.data || error);
     return [];
   }
 };
