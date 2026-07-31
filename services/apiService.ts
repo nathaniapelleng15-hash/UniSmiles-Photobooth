@@ -19,19 +19,28 @@ import axios from 'axios';
 // Memuat konfigurasi API (URL, API Key, Kiosk ID) secara dinamis dari localStorage agar langsung terupdate jika diubah di settings
 export const getApiConfig = () => {
   const stored = localStorage.getItem('pb_config');
+  // Kiosk registration writes this dedicated key. It must take precedence
+  // over an older pb_config value, otherwise a newly registered kiosk keeps
+  // requesting templates with the previous kiosk's API key.
+  const registeredKioskApiKey = localStorage.getItem('unismiles_kiosk_api_key')?.trim() || '';
   if (stored) {
     try {
       const parsed = JSON.parse(stored);
+      let rawUrl = parsed.backendUrl || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+      rawUrl = rawUrl.replace(/\/$/, '');
+      const backendUrl = rawUrl.includes('/api/v1/kiosk') ? rawUrl : `${rawUrl}/api/v1/kiosk`;
       return {
-        backendUrl: parsed.backendUrl || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
-        apiKey: parsed.apiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
+        backendUrl,
+        apiKey: registeredKioskApiKey || parsed.apiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
         kioskId: parsed.kioskId || import.meta.env.VITE_KIOSK_ID || 'K-001'
       };
     } catch (_) {}
   }
+  let rawUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
+  const backendUrl = rawUrl.includes('/api/v1/kiosk') ? rawUrl : `${rawUrl}/api/v1/kiosk`;
   return {
-    backendUrl: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
-    apiKey: import.meta.env.VITE_KIOSK_API_KEY || '',
+    backendUrl,
+    apiKey: registeredKioskApiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
     kioskId: import.meta.env.VITE_KIOSK_ID || 'K-001'
   };
 };
@@ -48,6 +57,8 @@ export interface SessionData {
   id: string;
   kiosk_id: string;
   frame_template_id?: number | null;
+  /** Harga yang dihitung backend untuk sesi ini, jika endpoint menyediakannya. */
+  amount?: number | null;
   status: 'active' | 'completed' | 'abandoned';
 }
 
@@ -92,15 +103,17 @@ apiClient.interceptors.request.use((config) => {
 // ─── Health Check ─────────────────────────────────────────────────────────────
 
 /**
- * Cek apakah backend server aktif.
- * Tidak butuh auth — bisa dipanggil saat kiosk startup.
+ * Cek apakah backend server aktif & API Key valid.
  */
 export const checkBackendHealth = async (url: string, currentApiKey: string): Promise<boolean> => {
   try {
-    const targetUrl = url || getApiConfig().backendUrl;
+    let targetUrl = (url || getApiConfig().backendUrl).replace(/\/$/, '');
+    if (!targetUrl.includes('/api/v1/kiosk')) {
+      targetUrl = `${targetUrl}/api/v1/kiosk`;
+    }
     const res = await axios.get(`${targetUrl}/payments`, {
       headers: {
-        'x-api-key': currentApiKey
+        'x-api-key': currentApiKey.trim()
       }
     });
     if (res.status === 200) {
@@ -109,7 +122,7 @@ export const checkBackendHealth = async (url: string, currentApiKey: string): Pr
     }
     return false;
   } catch (error) {
-    console.error('❌ Backend tidak dapat dijangkau:', error);
+    console.error('❌ Backend tidak dapat dijangkau / API Key tidak valid:', error);
     return false;
   }
 };
@@ -137,7 +150,14 @@ export const startSession = async (
 
     if (data.success && (data as any).session_code) {
       console.log(`🎬 Sesi dimulai: ${(data as any).session_code}`);
-      return { id: (data as any).session_code, kiosk_id: kioskId, status: 'active' } as SessionData;
+      const amount = Number((data as any).amount ?? (data as any).price ?? (data as any).data?.amount ?? (data as any).data?.price);
+      return {
+        id: (data as any).session_code,
+        kiosk_id: kioskId,
+        frame_template_id: frameTemplateId || null,
+        amount: Number.isFinite(amount) && amount > 0 ? amount : null,
+        status: 'active'
+      } as SessionData;
     } else {
       console.error('Gagal memulai sesi:', data.message);
       return null;
@@ -234,10 +254,16 @@ export const getPhotosBySession = async (sessionId: string): Promise<PhotoData[]
 
 export const fetchTemplates = async (): Promise<any[]> => {
   try {
-    const res = await apiClient.get('/templates');
+    // Frame dimensions/styles are editable from the admin panel. Do not let
+    // a browser/proxy cache keep the previous template configuration.
+    const res = await apiClient.get('/templates', {
+      headers: { 'Cache-Control': 'no-store, no-cache', Pragma: 'no-cache' },
+      params: { _t: Date.now() }
+    });
     const data = res.data;
     if (data.success) {
-      return data.data || [];
+      const templates = data.data || [];
+      if (templates.length > 0) return templates;
     }
     return [];
   } catch (error: any) {

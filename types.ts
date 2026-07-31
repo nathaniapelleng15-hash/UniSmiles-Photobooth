@@ -55,11 +55,15 @@ export interface FrameElement {
   textDecoration?: string; // 'underline' | 'none'
   color?: string;
   effect?: 'none' | 'shadow' | 'outline' | 'neon';
+  /** Admin image assets use x/y as the top-left corner. */
+  anchor?: 'center' | 'top-left';
 }
 
 export interface FrameStyle {
   id: string;
   name: string;
+  /** Optional per-template price; layout.price remains the fallback. */
+  price?: number;
   // Deprecated usage of simple URL, but kept for backward compat if needed, 
   // though we will favor the config below:
   overlayUrl?: string; 

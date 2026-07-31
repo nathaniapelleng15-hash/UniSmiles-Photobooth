@@ -4,7 +4,7 @@ import {
   Check, Image as ImageIcon, ChevronLeft, SwitchCamera, Send, Mail, QrCode, Printer,
   Lock, Unlock, Scan, X, ChevronUp, ChevronDown, Loader2, Wand2, LayoutTemplate, AlertCircle, AlertTriangle
 } from 'lucide-react';
-import { FrameLayout, FrameStyle, PhotoFilter, GridLayoutId, VirtualBackground, FrameElement } from '../types';
+import { FrameLayout, FrameStyle, PhotoFilter, GridLayoutId, VirtualBackground, FrameElement, STORAGE_KEYS } from '../types';
 import { getStoredFrames, getStoredFilters, getLayoutConfig, getStoredBackgrounds, getAppConfig } from '../services/storageService';
 import { useAirGesture } from './useAirGesture';
 import { startSession, completeSession, uploadPhoto, sendPhotoByEmail, fetchPaymentProfile, verifyPayment, fetchTemplates } from '../services/apiService';
@@ -16,11 +16,212 @@ const GLOBAL_SCALE = 1.0;
 const SHUTTER_SOUND_URL = "https://assets.mixkit.co/active_storage/sfx/2578/2578-preview.mp3";
 const COUNTDOWN_SOUND_URL = "https://cdn.pixabay.com/download/audio/2022/03/24/audio_cda640386c.mp3?filename=beep-6-96243.mp3";
 
+// Total time for one photo session (including any retakes). The mapping keeps
+// the requested package timings and gives the same +1 minute progression for
+// layouts with another number of slots.
+const getCaptureDurationSeconds = (slotCount: number): number => {
+  if (slotCount <= 1) return 3 * 60;
+  return (slotCount + 2) * 60;
+};
+
+const formatCaptureTime = (seconds: number): string => {
+  const minutes = Math.floor(seconds / 60).toString().padStart(2, '0');
+  const secs = (seconds % 60).toString().padStart(2, '0');
+  return `${minutes}:${secs}`;
+};
+
 interface PhotoBoothProps {
   onAdminClick: () => void;
 }
 
 type BoothStep = 'LANDING' | 'PACKAGE' | 'LAYOUT' | 'PAYMENT' | 'CAPTURE' | 'EDIT' | 'RESULT';
+
+// Harga bisa dikirim backend sebagai `price`, `layout_price`, atau di dalam
+// layout_config (format lama). Jangan gunakan harga UI sebagai sumber payment.
+const positiveNumber = (...values: unknown[]): number | null => {
+  for (const value of values) {
+    const numberValue = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+    if (typeof numberValue === 'number' && Number.isFinite(numberValue) && numberValue > 0) return numberValue;
+  }
+  return null;
+};
+
+const normalizeFrameBackground = (style: any, config: any): any => {
+  const source = style?.backgroundConfig ?? style?.background_config
+    ?? config?.backgroundConfig ?? config?.background_config ?? config?.background ?? style?.background;
+  if (!source || typeof source !== 'object') return { type: 'solid', color: '#ffffff' };
+  const type = source.type ?? source.kind ?? 'solid';
+  if (type !== 'gradient') return { ...source, type, color: source.color ?? source.backgroundColor ?? '#ffffff' };
+  const rawStops = source.gradientStops ?? source.gradient_stops ?? source.stops ?? [];
+  return {
+    ...source,
+    type: 'gradient',
+    gradientType: source.gradientType ?? source.gradient_type ?? source.style ?? 'linear',
+    gradientAngle: Number(source.gradientAngle ?? source.gradient_angle ?? source.angle ?? 90),
+    gradientStops: rawStops.map((stop: any) => ({
+      color: stop.color ?? stop.hex ?? '#ffffff',
+      offset: Number(stop.offset ?? stop.position ?? stop.percent ?? 0)
+    }))
+  };
+};
+
+// Admin stores the linear-gradient angle as a canvas/vector angle
+// (0deg = right, 90deg = down). CSS uses the opposite gradient direction
+// for the same axis, so convert only when building CSS. This keeps the
+// Admin first stop at the same visual side (e.g. 88deg: cyan top, pink bottom).
+const adminAngleToCssAngle = (angle: number): number => 90 + angle;
+
+const bustFrameAssetCache = (url: string | undefined): string | undefined => {
+  if (!url || url.startsWith('data:') || url.startsWith('blob:')) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}`;
+};
+
+// Admin versions use both `elements` and `assetElements` for artwork placed
+// on a frame. Kiosk rendering uses FrameElement, so normalize both payloads
+// into the same shape here instead of silently dropping uploaded logos.
+const resolveFrameAssetUrl = (value: unknown): string => {
+  if (typeof value !== 'string' || !value) return '';
+  if (/^(data:|blob:|https?:\/\/)/i.test(value)) return value;
+  const backend = (getAppConfig().backendUrl || 'http://localhost:8000').replace(/\/$/, '');
+  const root = backend.replace(/\/api\/v1(?:\/(?:kiosk|admin))?$/, '');
+  return value.startsWith('/') ? `${root}${value}` : `${root}/${value}`;
+};
+
+const normalizeFrameElements = (style: any, config: any): FrameElement[] => {
+  const primaryElements = Array.isArray(style?.elements)
+    ? style.elements
+    : (Array.isArray(config?.elements) ? config.elements : []);
+  const assetElements = [
+    ...(Array.isArray(style?.assetElements) ? style.assetElements : []),
+    ...(Array.isArray(style?.asset_elements) ? style.asset_elements : []),
+    ...(Array.isArray(config?.assetElements) ? config.assetElements : []),
+    ...(Array.isArray(config?.asset_elements) ? config.asset_elements : [])
+  ].map((element: any) => ({ ...element, __assetElement: true }));
+  const rawElements = [
+    ...primaryElements,
+    ...assetElements
+  ];
+  const seen = new Set<string>();
+  const canvasWidth = Number(config?.width ?? config?.canvasWidth ?? 0);
+  const canvasHeight = Number(config?.height ?? config?.canvasHeight ?? 0);
+
+  return rawElements.map((raw: any, index: number) => {
+    const source = raw?.content ?? raw?.url ?? raw?.src ?? raw?.imageUrl ?? raw?.image_url ?? '';
+    const isText = raw?.type === 'text' || (raw?.text && !source);
+    const rawId = String(raw?.id ?? `frame-element-${index}`);
+    const id = seen.has(rawId) ? `${rawId}-${index}` : rawId;
+    seen.add(rawId);
+
+    let x = Number(raw?.x ?? 50);
+    let y = Number(raw?.y ?? 50);
+    let width = Number(raw?.width ?? raw?.w ?? (isText ? 0 : 20));
+    // New Admin payloads use percentages for elements; support older pixel
+    // payloads when a canvas size is present.
+    if (canvasWidth > 0 && x > 100) x = (x / canvasWidth) * 100;
+    if (canvasHeight > 0 && y > 100) y = (y / canvasHeight) * 100;
+    if (canvasWidth > 0 && width > 100) width = (width / canvasWidth) * 100;
+    let height = Number(raw?.height ?? raw?.h ?? 0);
+    if (canvasHeight > 0 && height > 100) height = (height / canvasHeight) * 100;
+
+    return {
+      ...raw,
+      id,
+      type: isText ? 'text' : 'sticker',
+      content: isText ? String(raw?.content ?? raw?.text ?? '') : bustFrameAssetCache(resolveFrameAssetUrl(source)),
+      x, y, width,
+      height,
+      rotation: Number(raw?.rotation ?? 0),
+      opacity: Number(raw?.opacity ?? 1),
+      zIndex: Number(raw?.zIndex ?? raw?.z_index ?? index),
+      anchor: raw?.anchor ?? (raw?.__assetElement ? 'top-left' : 'center')
+    } as FrameElement;
+  });
+};
+
+const normalizeTemplatePrices = (templates: any[]): FrameLayout[] => templates.map((layout: any) => {
+  let layoutConfig = layout?.layout_config;
+  if (typeof layoutConfig === 'string') {
+    try { layoutConfig = JSON.parse(layoutConfig); } catch (_) { layoutConfig = null; }
+  }
+  const price = positiveNumber(
+    layout?.price,
+    layout?.layout_price,
+    layout?.base_price,
+    layoutConfig?.price,
+    layoutConfig?.layout_price,
+    layoutConfig?.base_price,
+    ...(Array.isArray(layout?.styles) ? layout.styles.flatMap((style: any) => [style?.price, style?._price, style?._layoutConfig?.price, style?._layoutConfig?.layout_price]) : [])
+  );
+  const normalizedStyles = Array.isArray(layout?.styles)
+    ? layout.styles.map((style: any) => {
+        // Admin may return the canonical frame object either inside
+        // `_layoutConfig`/`layout_config` or directly on the style itself.
+        // Keep both response shapes equivalent before rendering.
+        // API contract priority: explicit frameConfig first, then
+        // layout_config, then the legacy internal field.
+        let styleConfig = style?.frameConfig ?? style?.frame_config
+          ?? style?.layout_config ?? style?._layoutConfig;
+        const hasOwnVisualConfig = style?.backgroundConfig || style?.background_config
+          || style?.previewUrl || style?.preview_url || style?.overlayUrl || style?.overlay_url;
+        if (!styleConfig && (Array.isArray(style?.slots) || style?.width || style?.height || hasOwnVisualConfig)) {
+          styleConfig = style;
+        }
+        styleConfig = styleConfig ?? style?.frameConfig ?? style?.frame_config
+          ?? layout?.frameConfig ?? layout?.frame_config ?? layoutConfig;
+        if (typeof styleConfig === 'string') {
+          try { styleConfig = JSON.parse(styleConfig); } catch (_) { styleConfig = null; }
+        }
+        const canvasWidth = styleConfig?.width ?? styleConfig?.canvasWidth
+          ?? style?.canvasWidth ?? style?.width
+          ?? layout?.canvasWidth ?? layout?.width
+          ?? layoutConfig?.canvasWidth ?? layoutConfig?.width;
+        const canvasHeight = styleConfig?.height ?? styleConfig?.canvasHeight
+          ?? style?.canvasHeight ?? style?.height
+          ?? layout?.canvasHeight ?? layout?.height
+          ?? layoutConfig?.canvasHeight ?? layoutConfig?.height;
+
+        // Older responses put slots in style._layoutConfig (array), while
+        // the canvas dimensions live in the parent layout_config. Preserve
+        // both by wrapping the slots in the normalized object shape.
+        if (Array.isArray(styleConfig) && (canvasWidth || canvasHeight)) {
+          styleConfig = { slots: styleConfig, width: canvasWidth, height: canvasHeight, units: 'pixel' };
+        } else if (styleConfig && typeof styleConfig === 'object' && !Array.isArray(styleConfig)) {
+          styleConfig = {
+            ...styleConfig,
+            width: styleConfig.width ?? styleConfig.canvasWidth ?? canvasWidth,
+            height: styleConfig.height ?? styleConfig.canvasHeight ?? canvasHeight,
+            // Geometry may be inherited from the layout, but never inherit
+            // its background: each Admin style owns its own gradient.
+            slots: styleConfig.slots ?? layoutConfig?.slots,
+            // Canonical Admin slots are pixels. Only an explicit percentage
+            // unit is allowed to opt into percentage coordinates.
+            units: styleConfig.units ?? styleConfig.slotUnits ?? 'pixel'
+          };
+        } else if (canvasWidth || canvasHeight) {
+          styleConfig = { width: canvasWidth, height: canvasHeight, units: 'pixel' };
+        }
+        const canonical = styleConfig && typeof styleConfig === 'object' && !Array.isArray(styleConfig)
+          ? styleConfig
+          : null;
+        return canonical
+          ? {
+              ...style,
+              _layoutConfig: canonical,
+              backgroundConfig: normalizeFrameBackground(style, canonical),
+              elements: normalizeFrameElements(style, canonical),
+              // Admin may overwrite an existing uploaded file at the same URL.
+              // Bust the browser cache so the kiosk displays the new artwork.
+              overlayUrl: bustFrameAssetCache(style.overlayUrl ?? style.overlay_url ?? canonical.overlayUrl ?? canonical.overlay_url),
+              slotBorder: style.slotBorder ?? style.slot_border ?? canonical.slotBorder ?? canonical.slot_border,
+              slotBorderColor: style.slotBorderColor ?? style.slot_border_color ?? canonical.slotBorderColor ?? canonical.slot_border_color,
+              slotBorderWidth: style.slotBorderWidth ?? style.slot_border_width ?? canonical.slotBorderWidth ?? canonical.slot_border_width
+            }
+          : style;
+      })
+    : layout?.styles;
+  const normalizedLayout = normalizedStyles ? { ...layout, styles: normalizedStyles } : layout;
+  return price === null ? normalizedLayout : { ...normalizedLayout, price };
+});
 
 // --- OPTIMIZATION: Global Image Cache ---
 // Stores URL -> Base64 mapping to prevent re-fetching same assets
@@ -206,9 +407,111 @@ const BoothWrapper: React.FC<BoothWrapperProps> = ({ children, title, subtitle, 
   </div>
 );
 
+// --- Helper: resolve actual layout config from DB frame's _layoutConfig or fallback to preset ---
+// DB templates store slot data in _layoutConfig in two formats:
+//   1. Array [{x, y, w, h}]           — admin "generate" route (absolute pixels on 1200×1800)
+//   2. Object {slots:[{x,y,width,height}], orientation} — admin "upload" route (percentage-based, 0-100)
+const getEffectiveLayoutConfig = (style: FrameStyle | null | undefined, layoutId: string | null | undefined) => {
+    const fallback = getLayoutConfig(layoutId || '1x1');
+    if (!style) return fallback;
+    // API contract priority: frameConfig > layout_config > legacy field.
+    let raw = (style as any).frameConfig ?? (style as any).frame_config
+        ?? (style as any).layout_config ?? (style as any)._layoutConfig;
+    if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch (_) { raw = null; }
+    }
+    if (!raw) {
+    }
+    if (!raw && (Array.isArray((style as any).slots) || (style as any).width || (style as any).height)) {
+        // Direct canonical style payload: { width, height, slots, ... }.
+        raw = style as any;
+    }
+    if (raw && !Array.isArray(raw) && typeof raw === 'object' && raw.layout_config) {
+        raw = raw.layout_config;
+        if (typeof raw === 'string') {
+            try { raw = JSON.parse(raw); } catch (_) { raw = null; }
+        }
+    }
+    if (!raw) return fallback;
+
+    // The admin editor owns the canvas size. Do not force its slots into the
+    // old local presets: that changes the aspect ratio when the admin resizes
+    // a frame. Support both the current fields and a few legacy API shapes.
+    const rawCanvas = raw && !Array.isArray(raw) && typeof raw === 'object'
+        ? (raw.canvas || raw.frame || raw.layout || raw)
+        : {};
+    const styleMeta = style as any;
+    const targetW = Number(rawCanvas.width ?? rawCanvas.canvasWidth ?? styleMeta.canvasWidth ?? styleMeta.width);
+    const targetH = Number(rawCanvas.height ?? rawCanvas.canvasHeight ?? styleMeta.canvasHeight ?? styleMeta.height);
+    const width = Number.isFinite(targetW) && targetW > 0 ? targetW : fallback.width;
+    const height = Number.isFinite(targetH) && targetH > 0 ? targetH : fallback.height;
+
+    // Case 1: Array of {x, y, w, h} — absolute pixel values from admin layout generator
+    if (Array.isArray(raw) && raw.length > 0) {
+        const slots = raw
+            .map((s: any) => ({
+                x: Number(s.x ?? 0),
+                y: Number(s.y ?? 0),
+                width: Number(s.w ?? s.width ?? 0),
+                height: Number(s.h ?? s.height ?? 0),
+            }))
+            .filter(s => s.width > 0 && s.height > 0);
+        if (slots.length > 0) return { width, height, slots };
+    }
+
+    // Case 2: Object {slots:[{x, y, width, height}]} — percentage-based (0-100) or pixel slots.
+    // The admin editor has historically emitted both width/height and w/h.
+    if (raw && typeof raw === 'object' && Array.isArray(raw.slots) && raw.slots.length > 0) {
+        const first = raw.slots[0];
+        const sourceW = Number(rawCanvas.width) > 0 ? Number(rawCanvas.width) : width;
+        const sourceH = Number(rawCanvas.height) > 0 ? Number(rawCanvas.height) : height;
+        const firstSlotWidth = Number(first.width ?? first.w);
+        const firstSlotHeight = Number(first.height ?? first.h);
+        const declaredUnits = String(raw.units ?? raw.slotUnits ?? raw.coordinateType ?? '').toLowerCase();
+        // A canonical Admin payload always uses pixel coordinates. Infer
+        // percentages only for legacy payloads that have no canvas dimensions
+        // and explicitly look like 0..100 coordinates.
+        const hasCanvasDimensions = Number(rawCanvas.width) > 0 || Number(rawCanvas.height) > 0;
+        const isPct = declaredUnits === 'percent' || declaredUnits === 'percentage' || declaredUnits === '%'
+            || (!hasCanvasDimensions && declaredUnits !== 'pixel' && declaredUnits !== 'pixels'
+                && Number.isFinite(firstSlotWidth) && Number.isFinite(firstSlotHeight)
+                && firstSlotWidth <= 100 && firstSlotHeight <= 100);
+        const slots = raw.slots
+            .map((s: any) => ({
+                x: Math.round((Number(s.x ?? 0) / (isPct ? 100 : sourceW)) * width),
+                y: Math.round((Number(s.y ?? 0) / (isPct ? 100 : sourceH)) * height),
+                width: Math.round((Number(s.width ?? s.w ?? 0) / (isPct ? 100 : sourceW)) * width),
+                height: Math.round((Number(s.height ?? s.h ?? 0) / (isPct ? 100 : sourceH)) * height),
+            }))
+            .filter((s: any) => s.width > 0 && s.height > 0);
+        if (slots.length > 0) return { width, height, slots };
+    }
+
+    return fallback;
+};
+
+// Slot borders are part of the Admin frame styling, not a thumbnail-only hint.
+// Accept the names used by the different Admin/API versions.
+const getSlotBorderConfig = (style: FrameStyle | null | undefined) => {
+    const raw = (style as any)?._layoutConfig;
+    const config = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const border = config.slotBorder ?? config.slot_border ?? (style as any)?.slotBorder
+        ?? (style as any)?.slot_border ?? {};
+    const color = border.color ?? config.slotBorderColor ?? config.slot_border_color
+        ?? config.borderColor ?? config.border_color ?? config.accentColor ?? config.accent_color
+        ?? (style as any)?.slotBorderColor ?? (style as any)?.slot_border_color
+        ?? (style as any)?.borderColor ?? (style as any)?._accentColor
+        ?? '#ffffff';
+    const width = Number(border.width ?? config.slotBorderWidth ?? config.slot_border_width
+        ?? config.borderWidth ?? config.border_width ?? (style as any)?.slotBorderWidth
+        ?? (style as any)?.slot_border_width ?? (style as any)?.borderWidth ?? 2);
+    return { color, width: Number.isFinite(width) && width > 0 ? width : 2 };
+};
+
 // --- Detailed Frame Thumbnail ---
 const FrameThumbnail: React.FC<{ style: FrameStyle, layoutId: string }> = ({ style, layoutId }) => {
-    const config = getLayoutConfig(layoutId);
+    const config = getEffectiveLayoutConfig(style, layoutId);
+    const slotBorder = getSlotBorderConfig(style);
     let bgStyle: React.CSSProperties = { width: '100%', height: '100%', position: 'absolute', top: 0, left: 0 };
     
     // Simple estimation for thumbnails: assume thumbnail width is around 150px
@@ -222,25 +525,43 @@ const FrameThumbnail: React.FC<{ style: FrameStyle, layoutId: string }> = ({ sty
         if (style.backgroundConfig.gradientType === 'radial') {
             bgStyle.background = `radial-gradient(circle, ${stops})`;
         } else {
-            bgStyle.background = `linear-gradient(${style.backgroundConfig.gradientAngle || 90}deg, ${stops})`;
+            bgStyle.background = `linear-gradient(${adminAngleToCssAngle(style.backgroundConfig.gradientAngle ?? 90)}deg, ${stops})`;
         }
     } else {
         bgStyle.backgroundColor = '#ffffff';
     }
 
+    const accentColor = (style as any)._accentColor || 'rgba(17,24,39,0.3)';
+
     return (
         <div className="relative w-full h-full overflow-hidden bg-white shadow-sm" style={{ aspectRatio: `${config.width} / ${config.height}` }}>
             <div style={bgStyle}></div>
+            {style.overlayUrl && (
+                <img 
+                    src={style.overlayUrl} 
+                    alt="overlay" 
+                    className="absolute inset-0 w-full h-full object-cover z-0 pointer-events-none"
+                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                />
+            )}
             {config.slots.map((slot, i) => (
-                <div key={`slot-${i}`} className="absolute bg-gray-900/10 border border-gray-900/20"
+                <div key={`slot-${i}`} className="absolute transition-colors flex items-center justify-center font-black text-[10px]"
                     style={{
                         left: `${(slot.x / config.width) * 100}%`,
                         top: `${(slot.y / config.height) * 100}%`,
                         width: `${(slot.width / config.width) * 100}%`,
                         height: `${(slot.height / config.height) * 100}%`,
+                        // Match the Admin editor: slot areas are visibly
+                        // filled, not only a barely visible 9% overlay.
+                        // Keep the frame artwork itself untouched; this fill
+                        // is only the thumbnail placeholder for empty slots.
+                        backgroundColor: 'rgba(156, 163, 175, 0.48)',
+                        border: `${Math.max(1, slotBorder.width * 0.75)}px solid ${slotBorder.color || accentColor}`,
+                        color: accentColor,
+                        zIndex: 1,
                     }}
                 >
-                    <div className="w-full h-full flex items-center justify-center opacity-30"><ImageIcon size={12} className="text-black" /></div>
+                    <span className="opacity-70 font-bold">{i + 1}</span>
                 </div>
             ))}
             {style.elements.map((el) => {
@@ -253,8 +574,9 @@ const FrameThumbnail: React.FC<{ style: FrameStyle, layoutId: string }> = ({ sty
                 return (
                     <div key={el.id} style={{
                             position: 'absolute', left: `${el.x}%`, top: `${el.y}%`,
-                            transform: `translate(-50%, -50%) rotate(${el.rotation}deg)`,
+                            transform: `${el.anchor === 'top-left' ? '' : 'translate(-50%, -50%) '}rotate(${el.rotation}deg)`,
                             width: el.type === 'text' ? 'auto' : `${widthVal}%`,
+                            height: el.type === 'text' || !el.height ? 'auto' : `${el.height}%`,
                             zIndex: 10, opacity: el.opacity,
                         }}
                     >
@@ -321,6 +643,11 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [flash, setFlash] = useState(false);
   const [isAutoCapturing, setIsAutoCapturing] = useState(false);
+  const [retakeIndex, setRetakeIndex] = useState<number | null>(null);
+  const [reviewPhotoIndex, setReviewPhotoIndex] = useState<number | null>(null);
+  const [captureDeadline, setCaptureDeadline] = useState<number | null>(null);
+  const [remainingCaptureSeconds, setRemainingCaptureSeconds] = useState(0);
+  const [captureExpired, setCaptureExpired] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryCount, setCameraRetryCount] = useState(0);
@@ -401,23 +728,31 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'preparing' | 'uploading' | 'success' | 'error'>('idle');
   const [sessionCode, setSessionCode] = useState<string>('');
   const [qrisUrl, setQrisUrl] = useState<string | null>(null);
+  const [qrisLoading, setQrisLoading] = useState(false);
   const [finalUploadedUrl, setFinalUploadedUrl] = useState<string | null>(null);
+  // Harga dari response start session adalah harga authoritative dari backend.
+  const [sessionAmount, setSessionAmount] = useState<number | null>(null);
+
+  const refreshFrames = useCallback(async () => {
+    const templates = await fetchTemplates();
+    if (!templates || templates.length === 0) return false;
+
+    const freshFrames = normalizeTemplatePrices(templates);
+    localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(freshFrames));
+    setFrames(freshFrames);
+    return true;
+  }, []);
 
   useEffect(() => {
-    fetchTemplates().then(templates => {
-      if (templates && templates.length > 0) {
-        setFrames(templates);
-      } else {
-        const allFrames = getStoredFrames(); // fallback
-        setFrames(allFrames);
-      }
+    refreshFrames().then((loaded) => {
+      if (!loaded) setFrames(getStoredFrames());
     });
 
     const allFilters = getStoredFilters().filter(f => f.enabled);
     setFilters(allFilters);
     setBackgrounds(getStoredBackgrounds());
     
-    fetchPaymentProfile().then(url => { if (url) setQrisUrl(url); });
+    // Initial QRIS fetch (also re-fetched each time PAYMENT step opens)
     
     const appConfig = getAppConfig();
     setCustomSubtitle(appConfig.customSubtitle || '');
@@ -449,19 +784,40 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       hands.onResults((results: any) => onHandResultsRef.current(results));
       handsRef.current = hands;
     }
-  }, []);
+  }, [refreshFrames]);
 
-  // --- BUG FIX: Auto-select first frame if none selected ---
+  // Admin updates can happen while the kiosk page stays open. Refresh when
+  // the tab is revisited and periodically while it remains visible.
   useEffect(() => {
-    // If we are in FRAMES or RESULT step, and no frame is selected yet, pick the first one from the current layout.
-    // This prevents the "blank image" or crash issue when finishing without selecting a frame.
-    if ((step === 'FRAMES' || step === 'RESULT') && !selectedFrame && selectedLayoutId) {
-        const layoutConfig = frames.find(f => f.id === selectedLayoutId);
-        if (layoutConfig && layoutConfig.styles.length > 0) {
-            setSelectedFrame(layoutConfig.styles[0]);
-        }
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') refreshFrames();
+    };
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('focus', refreshWhenVisible);
+    const interval = window.setInterval(refreshWhenVisible, 30_000);
+    return () => {
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('focus', refreshWhenVisible);
+      window.clearInterval(interval);
+    };
+  }, [refreshFrames]);
+
+  // Keep the main preview tied to the currently selected layout and the latest
+  // Admin response. Previously a frame from the previous layout could remain
+  // selected, so the thumbnails showed one template while the large preview
+  // rendered another template's color, slots, and dimensions.
+  useEffect(() => {
+    if (!selectedLayoutId) return;
+    const availableStyles = frames.filter(f => f.id === selectedLayoutId).flatMap(f => f.styles);
+    if (availableStyles.length === 0) return;
+
+    const currentStyle = selectedFrame ? availableStyles.find(style => style.id === selectedFrame.id) : null;
+    if (!currentStyle || currentStyle !== selectedFrame) {
+        setSelectedFrame(currentStyle || availableStyles[0]);
+        setProcessedFrame(null);
+        setAreAssetsReady(false);
     }
-  }, [step, selectedFrame, selectedLayoutId, frames]);
+  }, [selectedLayoutId, frames, selectedFrame]);
 
   // --- OPTIMIZATION: Process Frame Assets to Base64 ---
   useEffect(() => {
@@ -521,6 +877,17 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                 }
                 return el;
             }));
+
+            // The Admin frame image is part of the frame itself (borders,
+            // logos, decorations, etc.). Keep it in the processed frame so
+            // the kiosk preview and exported image use the same visual layer.
+            if (newFrame.overlayUrl?.startsWith('http')) {
+                try {
+                    newFrame.overlayUrl = await convertImageToBase64(newFrame.overlayUrl);
+                } catch (_) {
+                    // Keep the original URL as a DOM preview fallback.
+                }
+            }
 
             if (isMounted) {
                 newFrame.elements = newElements;
@@ -586,11 +953,18 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   // ── Air Cursor React Component ─────────────────────────────────────────────
   const AirCursor: React.FC = () => {
     const isVisible = gestureEnabled && cursorPos !== null && !isCursorLocked;
-    const { gesture, holdProgress, holdFired } = gestureState;
-    const circumference = 2 * Math.PI * 34; // r=34 for 80px SVG
-    const strokeDashoffset = circumference * (1 - (holdProgress || 0));
-    const gestureClass = gesture === 'pinch' ? 'pinch' : gesture === 'open_hand' ? 'open-hand' : '';
-    const labelText = gesture === 'pinch' ? '✌ PINCH' : gesture === 'open_hand' ? '✋ HOLD' : '';
+    const { gesture, holdFired, isPinching, isScrolling } = gestureState;
+
+    let gestureClass = '';
+    let labelText = '';
+    if (gesture === 'pinch') {
+      gestureClass = isScrolling ? 'pinch scrolling' : 'pinch';
+      labelText    = isScrolling ? '↕ Geser' : '🤏 Klik';
+    } else if (gesture === 'open_hand') {
+      gestureClass = 'open-hand';
+      labelText    = '✋ Arahkan';
+    }
+
     return (
       <div
         id="air-cursor"
@@ -601,22 +975,6 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           display: isVisible ? 'block' : 'none'
         }}
       >
-        {/* Progress ring SVG – only visible during open_hand hold */}
-        {gesture === 'open_hand' && holdProgress > 0 && (
-          <svg id="air-cursor-progress-ring" className="air-cursor__svg" viewBox="0 0 80 80">
-            <circle cx="40" cy="40" r="34" fill="none" stroke="rgba(246,205,70,0.2)" strokeWidth="4" />
-            <circle
-              className="air-cursor__progress-circle"
-              cx="40" cy="40" r="34"
-              fill="none"
-              stroke={holdProgress >= 1 ? '#fff' : '#f6cd46'}
-              strokeWidth="4"
-              strokeLinecap="round"
-              strokeDasharray={circumference}
-              strokeDashoffset={strokeDashoffset}
-            />
-          </svg>
-        )}
         <div className="air-cursor__ring" />
         <div className="air-cursor__dot" />
         {labelText && <div className="air-cursor__label">{labelText}</div>}
@@ -658,12 +1016,26 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   // Robust Start Camera with Error Handling and Retry Mechanism
   useEffect(() => {
     let isActive = true;
+    const shouldUseCamera = step === 'CAPTURE' || isCalibrating;
+
+    // Do not ask for camera permission while the visitor is still choosing a
+    // package/layout or browsing the result screen. Camera permission belongs
+    // to this photobooth origin (localhost:3000), so it must be requested by
+    // the capture UI itself.
+    if (!shouldUseCamera) {
+      stopCamera();
+      setCameraError(null);
+      return;
+    }
     
     const startCamera = async () => {
       // Clear previous error when starting
       if (isActive) setCameraError(null);
 
       try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error('Browser ini tidak mendukung akses kamera. Buka photobooth melalui Chrome/Edge di http://localhost:3000.');
+        }
         const constraints: MediaStreamConstraints = { 
             video: { 
                 width: { ideal: 1280 }, 
@@ -711,13 +1083,15 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         console.error("Camera error:", err);
         if (isActive) {
             if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-                setCameraError("Camera access denied. Please allow permission in browser settings.");
+                setCameraError("Akses kamera ditolak. Klik ikon kamera di address bar localhost:3000, pilih Allow, lalu tekan Retry.");
             } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-                setCameraError("No camera device found.");
+                setCameraError("Kamera tidak ditemukan. Pastikan kamera terpasang dan tidak dinonaktifkan di System Settings.");
             } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-                setCameraError("Camera is in use by another application.");
+                setCameraError("Kamera sedang dipakai aplikasi lain. Tutup aplikasi tersebut, lalu tekan Retry.");
+            } else if (err.name === 'SecurityError' || !window.isSecureContext) {
+                setCameraError("Browser memblokir kamera. Jalankan photobooth dari http://localhost:3000, bukan dari file atau alamat backend.");
             } else {
-                setCameraError("Camera error: " + (err.message || "Unknown error"));
+                setCameraError("Kamera gagal dibuka: " + (err.message || "error tidak diketahui") + ". Tekan Retry setelah memeriksa izin browser.");
             }
         }
       }
@@ -729,7 +1103,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       isActive = false;
       stopCamera();
     };
-  }, [currentDeviceId, cameraRetryCount]); 
+  }, [step, isCalibrating, currentDeviceId, cameraRetryCount]);
 
   const toggleCamera = () => {
     if (devices.length < 2) return;
@@ -814,8 +1188,14 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       // Ensure state is clear when starting fresh
       setSelectedPackage(null);
       setCapturedPhotos([]);
+      setCaptureDeadline(null);
+      setRemainingCaptureSeconds(0);
+      setRetakeIndex(null);
+      setReviewPhotoIndex(null);
+      setCaptureExpired(false);
       setFinalUploadedUrl(null);
       setProcessedFrame(null);
+      setSessionAmount(null);
       setStep('PACKAGE');
   };
   const handlePackageSelect = (pkg: 'print' | 'digital') => {
@@ -824,14 +1204,31 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   };
   const handleLayoutSelect = async (id: GridLayoutId) => { 
     setSelectedLayoutId(id); 
+    const availableStyles = frames.filter(frame => frame.id === id).flatMap(frame => frame.styles);
+    // Select the first style of the new layout immediately. Do not leave the
+    // previous layout's frame active while payment/capture screens load.
+    setSelectedFrame(availableStyles[0] || null);
+    setProcessedFrame(null);
+    setAreAssetsReady(false);
     setCapturedPhotos([]); 
     setIsAutoCapturing(false); 
+    setCaptureDeadline(null);
+    setRemainingCaptureSeconds(0);
+    setRetakeIndex(null);
+    setReviewPhotoIndex(null);
+    setCaptureExpired(false);
     
     // Mulai session di database backend
     const kioskId = getAppConfig().kioskId || 'K-001';
-    const sessionData = await startSession(kioskId, null).catch(err => console.warn('⚠️ Gagal daftarkan sesi ke DB:', err));
+    const selectedLayout = frames.find(frame => frame.id === id);
+    const templateId = Number(selectedLayout?.styles?.[0]?.id);
+    const sessionData = await startSession(
+      kioskId,
+      Number.isInteger(templateId) && templateId > 0 ? templateId : null
+    ).catch(err => console.warn('⚠️ Gagal daftarkan sesi ke DB:', err));
     if (sessionData && (sessionData as any).id) {
        setSessionCode((sessionData as any).id);
+       setSessionAmount(sessionData.amount ?? null);
     }
     
     setStep('PAYMENT'); 
@@ -854,27 +1251,72 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   };
 
 
-  const startAutoCapture = () => setIsAutoCapturing(true);
+  const startAutoCapture = () => {
+    if (captureExpired) return;
+    if (!captureDeadline && selectedLayoutId) {
+      const slotCount = getEffectiveLayoutConfig(selectedFrame, selectedLayoutId).slots.length;
+      const durationSeconds = getCaptureDurationSeconds(slotCount);
+      setCaptureDeadline(Date.now() + durationSeconds * 1000);
+      setRemainingCaptureSeconds(durationSeconds);
+    }
+    setIsAutoCapturing(true);
+  };
   const takePhoto = useCallback(() => {
     if (!processingCanvasRef.current) return;
+    if (captureDeadline !== null && Date.now() >= captureDeadline) {
+      setCountdown(null);
+      setIsAutoCapturing(false);
+      setCaptureExpired(true);
+      return;
+    }
     setFlash(true);
     if (shutterAudioRef.current) { shutterAudioRef.current.currentTime = 0; shutterAudioRef.current.play().catch(e=>{}); }
     setTimeout(() => setFlash(false), 150); 
     const canvas = processingCanvasRef.current;
-    setCapturedPhotos(prev => [...prev, canvas.toDataURL('image/jpeg', 0.95)]);
+    const photo = canvas.toDataURL('image/jpeg', 0.95);
+    const photoIndex = retakeIndex === null ? capturedPhotos.length : retakeIndex;
+    setCapturedPhotos(prev => retakeIndex === null
+      ? [...prev, photo]
+      : prev.map((existingPhoto, index) => index === retakeIndex ? photo : existingPhoto)
+    );
     setCountdown(null);
-  }, []);
+    setRetakeIndex(null);
+    setIsAutoCapturing(false);
+    setReviewPhotoIndex(photoIndex);
+  }, [captureDeadline, retakeIndex, capturedPhotos.length]);
+
+  // Keep one session clock running while the user is taking or retaking photos.
+  useEffect(() => {
+    if (step !== 'CAPTURE' || captureDeadline === null) return;
+    const updateTimer = () => {
+      const seconds = Math.max(0, Math.ceil((captureDeadline - Date.now()) / 1000));
+      setRemainingCaptureSeconds(seconds);
+      if (seconds === 0) {
+        setIsAutoCapturing(false);
+        setCountdown(null);
+        setCaptureExpired(true);
+      }
+    };
+    updateTimer();
+    const timer = window.setInterval(updateTimer, 1000);
+    return () => window.clearInterval(timer);
+  }, [step, captureDeadline]);
 
   useEffect(() => {
     if (!isAutoCapturing || step !== 'CAPTURE') return;
-    const config = getLayoutConfig(selectedLayoutId!);
+    if (reviewPhotoIndex !== null) return;
+    const config = getEffectiveLayoutConfig(selectedFrame, selectedLayoutId!);
+    if (retakeIndex !== null) {
+        if (countdown === null && !flash) setCountdown(3);
+        return;
+    }
     if (capturedPhotos.length >= config.slots.length) {
         setIsAutoCapturing(false); setIsProcessing(true);
         setTimeout(() => { setStep('EDIT'); setIsProcessing(false); }, 1000);
         return;
     }
     if (countdown === null && !flash) setCountdown(3); 
-  }, [isAutoCapturing, capturedPhotos.length, step, selectedLayoutId, countdown, flash]);
+  }, [isAutoCapturing, capturedPhotos.length, step, selectedLayoutId, countdown, flash, retakeIndex, reviewPhotoIndex]);
 
   useEffect(() => {
     if (countdown === null) return;
@@ -888,6 +1330,11 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const handleRetake = () => {
     setCapturedPhotos([]); 
     setIsAutoCapturing(false); 
+    setRetakeIndex(null);
+    setReviewPhotoIndex(null);
+    setCaptureDeadline(null);
+    setRemainingCaptureSeconds(0);
+    setCaptureExpired(false);
     setStep('CAPTURE'); 
     setUploadStatus('idle'); 
     setFinalUploadedUrl(null); 
@@ -899,6 +1346,30 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     if (emailForm) { emailForm.classList.add('hidden'); emailForm.classList.remove('flex'); }
   };
 
+  const handleRetakePhoto = (index: number) => {
+    if (captureExpired) return;
+    setRetakeIndex(index);
+    setReviewPhotoIndex(null);
+    setCaptureExpired(false);
+    setStep('CAPTURE');
+    setIsAutoCapturing(true);
+  };
+
+  const handleContinueAfterReview = () => {
+    setReviewPhotoIndex(null);
+    const slotCount = selectedLayoutId
+      ? getEffectiveLayoutConfig(selectedFrame, selectedLayoutId).slots.length
+      : 0;
+
+    if (capturedPhotos.length >= slotCount) {
+      setIsProcessing(true);
+      setTimeout(() => { setStep('EDIT'); setIsProcessing(false); }, 700);
+      return;
+    }
+
+    setIsAutoCapturing(true);
+  };
+
   const handleHome = () => {
       // Soft Reset: Clear all state to initial values instead of forcing a page reload
       // This prevents black screen issues and feels faster
@@ -906,6 +1377,11 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
          completeSession(sessionCode).catch(e => console.error(e));
       }
       setCapturedPhotos([]);
+      setRetakeIndex(null);
+      setReviewPhotoIndex(null);
+      setCaptureDeadline(null);
+      setRemainingCaptureSeconds(0);
+      setCaptureExpired(false);
       setSelectedLayoutId(null);
       setSelectedBackground(null);
       setSelectedFilter(null);
@@ -950,8 +1426,8 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   // --- Final Image Generation (Canvas API — pixel-perfect at output resolution) ---
   const generateCompositeImage = async (): Promise<string | null> => {
     if (!selectedLayoutId || capturedPhotos.length === 0) return null;
-    const config = getLayoutConfig(selectedLayoutId);
     const frameToUse = processedFrame || selectedFrame;
+    const config = getEffectiveLayoutConfig(frameToUse, selectedLayoutId);
 
     const loadImg = (src: string): Promise<HTMLImageElement> =>
       new Promise((resolve, reject) => {
@@ -993,7 +1469,9 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           if (bg.gradientType === 'radial') {
             grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(canvas.width, canvas.height) / 2);
           } else {
-            const a = ((bg.gradientAngle ?? 135) * Math.PI) / 180;
+            // Export uses the Admin/canvas angle directly. The DOM preview
+            // converts this same value only because CSS uses another axis.
+            const a = ((bg.gradientAngle ?? 90) * Math.PI) / 180;
             const len = Math.sqrt(canvas.width ** 2 + canvas.height ** 2) / 2;
             grad = ctx.createLinearGradient(
               cx - Math.cos(a)*len, cy - Math.sin(a)*len,
@@ -1012,7 +1490,19 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
 
-      // 2 — Photos
+      // 2 — Admin frame artwork is the BACK layer. Frame uploads may contain
+      // the complete canvas artwork, so they must be drawn before photos;
+      // otherwise an opaque PNG would hide every captured photo.
+      if (frameToUse?.overlayUrl) {
+        try {
+          const overlay = await loadImg(frameToUse.overlayUrl);
+          ctx.drawImage(overlay, 0, 0, canvas.width, canvas.height);
+        } catch (e) {
+          console.warn('Admin frame artwork could not be rendered:', e);
+        }
+      }
+
+      // 3 — Photos, positioned using the Admin slot coordinates.
       for (let i = 0; i < config.slots.length; i++) {
         const slot = config.slots[i];
         const photo = capturedPhotos[i];
@@ -1031,7 +1521,23 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         } catch (e) { console.warn(`Slot ${i} draw failed`, e); }
       }
 
-      // 3 — Frame elements
+      // Slot borders belong to the Admin frame and must remain visible above
+      // captured photos in both the preview and the exported image.
+      const slotBorder = getSlotBorderConfig(frameToUse);
+      ctx.save();
+      ctx.strokeStyle = slotBorder.color;
+      ctx.lineWidth = slotBorder.width;
+      for (const slot of config.slots) {
+        ctx.strokeRect(
+          slot.x + slotBorder.width / 2,
+          slot.y + slotBorder.width / 2,
+          Math.max(0, slot.width - slotBorder.width),
+          Math.max(0, slot.height - slotBorder.width)
+        );
+      }
+      ctx.restore();
+
+      // 4 — Frame elements such as Hello/text/stickers remain above photos.
       for (const el of (frameToUse?.elements ?? [])) {
         ctx.save();
         ctx.globalAlpha = el.opacity ?? 1;
@@ -1051,7 +1557,14 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           try {
             const img = await loadImg(el.content);
             const w = ((el.width ?? 10) / 100) * canvas.width;
-            ctx.drawImage(img, -w/2, -w/2, w, w);
+            // Preserve the Admin asset box. Older elements have no height;
+            // for those, derive height from the image's natural aspect ratio.
+            const h = el.height && el.height > 0
+              ? (el.height / 100) * canvas.height
+              : w * (img.naturalHeight / Math.max(1, img.naturalWidth));
+            const offsetX = el.anchor === 'top-left' ? 0 : -w / 2;
+            const offsetY = el.anchor === 'top-left' ? 0 : -h / 2;
+            ctx.drawImage(img, offsetX, offsetY, w, h);
           } catch { /* skip */ }
         }
         ctx.restore();
@@ -1118,6 +1631,27 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       }
   }, [step, areAssetsReady, finalUploadedUrl, uploadStatus]);
 
+  // Re-fetch QRIS image every time user enters PAYMENT step
+  useEffect(() => {
+    if (step === 'PAYMENT') {
+      setQrisUrl(null);
+      setQrisLoading(true);
+      fetchPaymentProfile()
+        .then(url => { if (url) setQrisUrl(url); })
+        .finally(() => setQrisLoading(false));
+    }
+  }, [step]);
+
+  const selectedLayout = frames.find(frame => frame.id === selectedLayoutId);
+  const selectedFramePrice = positiveNumber(
+    selectedFrame?.price,
+    (selectedFrame as any)?._price,
+    (selectedFrame as any)?._layoutConfig?.price,
+    (selectedFrame as any)?._layoutConfig?.layout_price
+  );
+  const selectedLayoutPrice = positiveNumber(selectedLayout?.price);
+  const payableAmount = sessionAmount ?? selectedFramePrice ?? selectedLayoutPrice;
+
   const handleDownload = async () => {
       if (!areAssetsReady) {
           alert("Please wait for assets to load fully.");
@@ -1166,17 +1700,12 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       const dataUrl = await generateCompositeImage();
       if (dataUrl) {
           // Hitung dimensi fisik cetak berdasarkan layout
-          // Standard photo strip: 2x6 inch. Grid/Polaroid menyesuaikan.
-          const layoutPrintSizes: Record<string, { w: string, h: string }> = {
-              '1x1': { w: '4in', h: '6in' },    // Polaroid 4x6
-              '2x1': { w: '2in', h: '6in' },    // Strip 2x6
-              '3x1': { w: '2in', h: '6in' },    // Strip 2x6
-              '4x1': { w: '2in', h: '6in' },    // Strip 2x6
-              '2x2': { w: '4in', h: '6in' },    // Grid 4x6
-              '2x3': { w: '4in', h: '6in' },    // Grid 4x6
-              '3x3': { w: '6in', h: '8in' },    // Grid 6x8
-          };
-          const size = layoutPrintSizes[selectedLayoutId || '4x1'] || { w: '2in', h: '6in' };
+          // Keep the physical print ratio aligned with the admin canvas too.
+          // The generated image already uses the exact admin pixel dimensions.
+          const printConfig = getEffectiveLayoutConfig(processedFrame || selectedFrame, selectedLayoutId);
+          const printHeight = 6;
+          const printWidth = printHeight * (printConfig.width / printConfig.height);
+          const size = { w: `${printWidth}in`, h: `${printHeight}in` };
 
           const win = window.open('', '_blank');
           if (win) {
@@ -1220,7 +1749,10 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
 
   // --- Rendering Helpers ---
   const PreviewComponent = ({ shadow = true, maxHeightStr = '65vh', id }: { shadow?: boolean, maxHeightStr?: string, id?: string }) => {
-    if (!selectedLayoutId || capturedPhotos.length === 0) {
+    // The Customize screen must show the Admin slot placeholders before any
+    // photo is captured. Only the layout selection is required to render the
+    // frame preview; an empty photo array is a valid initial state.
+    if (!selectedLayoutId) {
         return (
             <div className="flex flex-col items-center justify-center h-full w-full bg-white/5 rounded-xl p-12 text-center text-white">
                 <AlertCircle size={48} className="text-red-400 mb-4" />
@@ -1229,7 +1761,8 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
             </div>
         );
     }
-    const config = getLayoutConfig(selectedLayoutId);
+    const frameToRenderForConfig = processedFrame || selectedFrame;
+    const config = getEffectiveLayoutConfig(frameToRenderForConfig, selectedLayoutId);
     const ratio = config.width / config.height;
     
     // IMPORTANT: If we are in RESULT step, we MUST use processedFrame. 
@@ -1266,7 +1799,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         
         const updateScale = () => {
             const domWidth = containerRef.current?.getBoundingClientRect().width || 0;
-            const cfg = getLayoutConfig(selectedLayoutId);
+            const cfg = getEffectiveLayoutConfig(processedFrame || selectedFrame, selectedLayoutId);
             if (cfg.width > 0 && domWidth > 0) {
                 setScaleFactor(domWidth / cfg.width);
             }
@@ -1287,7 +1820,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
          if (bg.type === 'solid') bgStyle.backgroundColor = bg.color;
          else if (bg.type === 'gradient') {
              const stops = bg.gradientStops?.map(s => `${s.color} ${s.offset}%`).join(', ');
-             bgStyle.background = bg.gradientType === 'radial' ? `radial-gradient(circle, ${stops})` : `linear-gradient(${bg.gradientAngle}deg, ${stops})`;
+             bgStyle.background = bg.gradientType === 'radial' ? `radial-gradient(circle, ${stops})` : `linear-gradient(${adminAngleToCssAngle(bg.gradientAngle ?? 90)}deg, ${stops})`;
          }
     } else { bgStyle.backgroundColor = '#fff'; }
 
@@ -1295,13 +1828,25 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         <div id={id} ref={containerRef} className={`relative mx-auto bg-white ${shadow ? 'shadow-2xl' : ''}`} style={{ width: '100%', maxWidth: `calc(${maxHeightStr} * ${ratio})` }}>
             <div className="relative w-full" style={{ paddingBottom: `${(1/ratio) * 100}%` }}>
                 <div className="absolute inset-0 overflow-hidden" style={bgStyle}>
+                    {frameToRender?.overlayUrl && (
+                        <img
+                            src={frameToRender.overlayUrl}
+                            alt=""
+                            className="absolute inset-0 w-full h-full object-fill pointer-events-none"
+                            style={{ zIndex: 0 }}
+                        />
+                    )}
                     {config.slots.map((slot, i) => {
                         const photo = capturedPhotos[i];
-                        if (!photo) return null;
+                        const slotBorder = getSlotBorderConfig(frameToRender);
                         return (
-                            <div key={i} className="absolute overflow-hidden" style={{ left: `${(slot.x / config.width) * 100}%`, top: `${(slot.y / config.height) * 100}%`, width: `${(slot.width / config.width) * 100}%`, height: `${(slot.height / config.height) * 100}%`, zIndex: 1 }}>
-                                {/* Captured photos are already Data URIs from canvas, so no CrossOrigin needed strictly, but adding it for safety doesn't hurt. */}
-                                <img src={photo} className="w-full h-full object-cover" style={{ filter: selectedFilter?.cssFilter || 'none' }} />
+                            <div key={i} className="absolute overflow-hidden flex items-center justify-center" style={{ left: `${(slot.x / config.width) * 100}%`, top: `${(slot.y / config.height) * 100}%`, width: `${(slot.width / config.width) * 100}%`, height: `${(slot.height / config.height) * 100}%`, zIndex: 1, boxSizing: 'border-box', border: `${Math.max(1, slotBorder.width * scaleFactor)}px solid ${slotBorder.color}`, backgroundColor: photo ? 'transparent' : 'rgba(156, 163, 175, 0.48)' }}>
+                                {photo ? (
+                                    /* Captured photos are Data URIs, so no CORS is needed. */
+                                    <img src={photo} className="w-full h-full object-cover" style={{ filter: selectedFilter?.cssFilter || 'none' }} />
+                                ) : (
+                                    <span className="font-bold text-white/75" style={{ fontSize: `${Math.max(12, 42 * scaleFactor)}px` }}>{i + 1}</span>
+                                )}
                             </div>
                         );
                     })}
@@ -1315,15 +1860,16 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                         
                         return (
                             <div key={el.id} style={{
-                                    position: 'absolute', left: `${el.x}%`, top: `${el.y}%`, transform: `translate(-50%, -50%) rotate(${el.rotation}deg)`,
-                                    zIndex: el.zIndex + 10, opacity: el.opacity, color: el.color, fontFamily: el.fontFamily,
+                                    position: 'absolute', left: `${el.x}%`, top: `${el.y}%`, transform: `${el.anchor === 'top-left' ? '' : 'translate(-50%, -50%) '}rotate(${el.rotation || 0}deg)`,
+                                    zIndex: (el.zIndex ?? 0) + 10, opacity: el.opacity ?? 1, color: el.color || '#000', fontFamily: el.fontFamily,
                                     fontSize: `${Math.max(1, fontSize)}px`, 
                                     fontWeight: el.fontWeight, fontStyle: el.fontStyle, textDecoration: el.textDecoration,
                                     textShadow: el.effect === 'shadow' ? '1px 1px 2px rgba(0,0,0,0.5)' : el.effect === 'neon' ? `0 0 5px ${el.color}, 0 0 10px ${el.color}` : 'none',
                                     WebkitTextStroke: el.effect === 'outline' ? `${strokeWidth}px black` : 'none', 
                                     whiteSpace: 'nowrap', 
                                     // Use max-content to prevent text stacking/wrapping during render
-                                    width: el.type === 'text' ? 'max-content' : `${widthVal}%`, 
+                                    width: el.type === 'text' ? 'max-content' : `${widthVal}%`,
+                                    height: el.type === 'text' || !el.height ? 'auto' : `${el.height}%`,
                                     // Explicit letter spacing to prevent overlap calculation errors in html2canvas
                                     letterSpacing: '0px',
                                     lineHeight: '1',
@@ -1389,7 +1935,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                        <p className="text-lg font-semibold text-green-400 mb-2">Instructions:</p>
                        <ul className="list-disc pl-5 space-y-2 text-sm opacity-90">
                            <li>Keep your hand inside the <span className="text-green-400 font-bold">GREEN BOX</span> to move the cursor.</li>
-                           <li><b>Pinch & Hold</b> to Drag. <b>Tap</b> to Click.</li>
+                           <li><b>Pinch</b> (jepit jari) untuk Klik button, pilih frame & filter, atau Geser.</li>
                        </ul>
                    </div>
               </div>
@@ -1440,7 +1986,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
             <div id="gesture-status-banner" className="absolute top-8 left-1/2 -translate-x-1/2 text-white/80 bg-black/30 px-6 py-2 rounded-full backdrop-blur text-lg pointer-events-none text-center whitespace-nowrap" style={{ display: gestureEnabled ? 'block' : 'none' }}>
                 {isCursorLocked
                   ? "🔒 Cursor Locked"
-                  : "✌ Pinch geser  ·  ✋ Tahan buka tangan = klik (3 detik)"}
+                  : "🤏 Pinch jari = Klik button / Pilih frame & filter / Geser"}
             </div>
           </div>
         </>
@@ -1522,14 +2068,24 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                                     <div className="flex justify-between items-center w-full mb-3 px-2">
                                         <span className="font-bold text-gray-800 text-lg md:text-xl tracking-wide">QRIS</span>
                                         <span className="text-[#00aead] font-black text-lg md:text-xl">
-                                            {new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(frames.find(f => f.id === selectedLayoutId)?.price || 45000)}
+                                            {payableAmount === null
+                                              ? 'Harga belum tersedia'
+                                              : new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(payableAmount)}
                                         </span>
                                     </div>
                                     <div className="flex-1 flex items-center justify-center w-full">
                                         {qrisUrl ? (
-                                            <img src={qrisUrl} alt="QRIS Uni" className="w-full h-auto max-h-[45vh] lg:max-h-[50vh] object-contain rounded-xl" />
+                                            <img
+                                              key={qrisUrl}
+                                              src={`${qrisUrl}?t=${Date.now()}`}
+                                              alt="QRIS Uni"
+                                              className="w-full h-auto max-h-[45vh] lg:max-h-[50vh] object-contain rounded-xl"
+                                            />
                                         ) : (
-                                            <div className="w-full h-[40vh] flex items-center justify-center text-gray-400">Loading QRIS...</div>
+                                            <div className="w-full h-[40vh] flex flex-col items-center justify-center text-gray-400 gap-3">
+                                              <div className="animate-spin border-4 border-white/20 border-t-yellow-400 rounded-full w-10 h-10" />
+                                              <span className="text-sm">Memuat QRIS...</span>
+                                            </div>
                                         )}
                                     </div>
                                 </div>
@@ -1563,9 +2119,51 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       {step === 'CAPTURE' && (
         <div className="h-full w-full bg-black relative overflow-hidden flex flex-col">
             <div className={`fixed inset-0 bg-white z-[100] pointer-events-none transition-opacity duration-[150ms] ${flash ? 'opacity-100' : 'opacity-0'}`} />
-            <div className="relative flex-1 w-full bg-black overflow-hidden">
-                <canvas id="camera-preview" ref={processingCanvasRef} className="w-full h-full object-cover transform scale-x-[-1]" />
-                {countdown !== null && <div id="countdown-display" className="absolute inset-0 flex items-center justify-center z-30"><span className="text-[20rem] font-bold text-white drop-shadow-[0_10px_20px_rgba(0,0,0,0.8)] animate-bounce font-display">{countdown}</span></div>}
+                <div className="relative flex-1 w-full bg-black overflow-hidden">
+                    <canvas id="camera-preview" ref={processingCanvasRef} className="w-full h-full object-cover transform scale-x-[-1]" />
+                    {countdown !== null && <div id="countdown-display" className="absolute inset-0 flex items-center justify-center z-30"><span className="text-[20rem] font-bold text-white drop-shadow-[0_10px_20px_rgba(0,0,0,0.8)] animate-bounce font-display">{countdown}</span></div>}
+                    {captureDeadline !== null ? (
+                      <div className={`absolute left-8 z-20 rounded-xl border px-4 py-2 backdrop-blur-md font-mono font-bold ${remainingCaptureSeconds <= 30 ? 'border-red-400 bg-red-500/40 text-red-100' : 'border-white/20 bg-black/40 text-white'}`} style={{ top: isAirTouch ? '3rem' : '2rem' }}>
+                        Waktu: {formatCaptureTime(remainingCaptureSeconds)}
+                      </div>
+                    ) : selectedLayoutId ? (
+                      <div className="absolute left-8 top-8 z-20 rounded-xl border border-white/20 bg-black/40 px-4 py-2 text-sm font-bold text-white/80 backdrop-blur-md">
+                        Batas sesi: {formatCaptureTime(getCaptureDurationSeconds(getEffectiveLayoutConfig(selectedFrame, selectedLayoutId).slots.length))}
+                      </div>
+                    ) : null}
+                    {captureExpired && (
+                      <div className="absolute inset-x-0 bottom-6 z-30 flex justify-center pointer-events-none">
+                        <span className="rounded-xl bg-red-600/90 px-5 py-3 text-sm font-bold text-white shadow-xl">Waktu pemotretan habis</span>
+                      </div>
+                    )}
+                    {reviewPhotoIndex !== null && capturedPhotos[reviewPhotoIndex] && (
+                      <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+                        <div className="flex max-h-full w-full max-w-md flex-col items-center gap-4 rounded-2xl border border-white/20 bg-[#0c1633]/95 p-4 shadow-2xl md:p-6">
+                          <p className="text-center text-lg font-bold text-white md:text-2xl">
+                            Foto {reviewPhotoIndex + 1} berhasil diambil
+                          </p>
+                          <img
+                            src={capturedPhotos[reviewPhotoIndex]}
+                            alt={`Preview foto ${reviewPhotoIndex + 1}`}
+                            className="max-h-[45vh] w-full rounded-xl object-contain"
+                          />
+                          <div className="flex w-full gap-3">
+                            <button
+                              onClick={() => handleRetakePhoto(reviewPhotoIndex)}
+                              className="flex-1 rounded-xl border border-white/25 bg-white/10 px-4 py-3 text-sm font-bold text-white transition-colors hover:bg-white/20 active:scale-95 md:text-base"
+                            >
+                              Retake Foto
+                            </button>
+                            <button
+                              onClick={handleContinueAfterReview}
+                              className="flex-1 rounded-xl bg-white px-4 py-3 text-sm font-bold text-[#0c1633] transition-colors hover:bg-gray-100 active:scale-95 md:text-base"
+                            >
+                              {capturedPhotos.length >= (selectedLayoutId ? getEffectiveLayoutConfig(selectedFrame, selectedLayoutId).slots.length : 0) ? 'Lanjut' : 'Foto Berikutnya'}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                 {isProcessing && <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-md z-40"><div className="text-center"><RefreshCw size={80} className="animate-spin text-white mb-6 mx-auto" /><h2 className="text-4xl font-bold text-white">Processing...</h2></div></div>}
                 <div className={`absolute right-8 z-20 flex flex-col gap-4 ${isAirTouch ? 'top-12' : 'top-8'}`}>
                         <button id="btn-switch-camera" onClick={toggleCamera} className={`${isAirTouch ? 'w-24 h-24' : 'w-20 h-20'} rounded-full bg-black/40 backdrop-blur-md border-2 border-white/20 flex items-center justify-center text-white hover:bg-white/20 transition-all active:scale-95`}><SwitchCamera size={isAirTouch?48:40} /></button>
@@ -1577,7 +2175,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                 <div className="flex justify-between items-center h-full gap-2">
                     {/* Thumbnails */}
                     <div className={`flex gap-1.5 overflow-x-auto items-center h-full ${isVertical ? 'py-1.5' : 'py-2 gap-2'}`}>
-                        {Array.from({length: (selectedLayoutId ? getLayoutConfig(selectedLayoutId).slots.length : 0)}).map((_, i) => (
+                        {Array.from({length: (selectedLayoutId ? getEffectiveLayoutConfig(selectedFrame, selectedLayoutId).slots.length : 0)}).map((_, i) => (
                             <div key={i} className={`flex-shrink-0 rounded-lg border-2 flex items-center justify-center overflow-hidden bg-white/5 ${capturedPhotos[i] ? 'border-green-400' : 'border-white/20'} ${isVertical ? 'w-10 h-14' : 'w-16 h-24 md:w-24 md:h-32'}`}>
                                 {capturedPhotos[i] ? <img src={capturedPhotos[i]} className="w-full h-full object-cover" /> : <span className={`text-white/30 font-bold ${isVertical ? 'text-sm' : 'text-lg'}`}>{i + 1}</span>}
                             </div>
@@ -1587,7 +2185,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                     <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-1">
                         {!isAutoCapturing && capturedPhotos.length === 0 && (
                           <>
-                            <button id="btn-start-capture" onClick={startAutoCapture} className={`active:scale-95 transition-transform hover:scale-105 ${isAirTouch ? 'w-[200px] md:w-[250px]' : isVertical ? 'w-[90px]' : 'w-[150px] md:w-[200px]'}`}>
+                            <button id="btn-start-capture" onClick={startAutoCapture} disabled={captureExpired} className={`active:scale-95 transition-transform hover:scale-105 disabled:opacity-40 ${isAirTouch ? 'w-[200px] md:w-[250px]' : isVertical ? 'w-[90px]' : 'w-[150px] md:w-[200px]'}`}>
                               <img src="/assets/start photo.png" alt="Start Photo" className="w-full h-auto drop-shadow-xl animate-pulse" />
                             </button>
                             <div 
@@ -1607,8 +2205,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                     </div>
                     {/* Right: count + retake */}
                     <div className="flex flex-col items-end gap-1.5 shrink-0">
-                        <div id="photo-counter" className={`text-white/70 font-mono ${isVertical ? 'text-xs' : 'text-sm'}`}>{capturedPhotos.length}/{selectedLayoutId ? getLayoutConfig(selectedLayoutId).slots.length : 0}</div>
-                        {!isAutoCapturing && capturedPhotos.length > 0 && <button onClick={handleRetake} className={`bg-white/10 border border-white/20 rounded-xl text-white hover:bg-white/20 font-bold active:scale-95 ${isAirTouch ? 'px-6 py-4 text-lg' : isVertical ? 'px-3 py-1.5 text-xs' : 'px-8 py-4 text-xl'}`}>Retake</button>}
+                        <div id="photo-counter" className={`text-white/70 font-mono ${isVertical ? 'text-xs' : 'text-sm'}`}>{capturedPhotos.length}/{selectedLayoutId ? getEffectiveLayoutConfig(selectedFrame, selectedLayoutId).slots.length : 0}</div>
                     </div>
                 </div>
             </div>
@@ -1621,7 +2218,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                 {/* Preview area – top in vertical, left in horizontal */}
                 <div className={`flex flex-col items-center justify-center overflow-hidden relative ${isVertical ? 'h-[38%] shrink-0 p-2 pt-3' : 'flex-1 p-12'}`}>
                     <div className="w-full h-full flex items-center justify-center drop-shadow-[0_20px_50px_rgba(0,0,0,0.5)]">
-                        <PreviewComponent maxHeightStr={isVertical ? '35vh' : '60vh'} />
+                        <PreviewComponent maxHeightStr={isVertical ? '45vh' : '75vh'} />
                     </div>
                     {!isVertical && (
                       <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-max flex items-center justify-center gap-12 opacity-100 pointer-events-none">
@@ -1654,26 +2251,30 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                     <div className={`flex-1 overflow-y-auto min-h-0 custom-scrollbar ${isVertical ? 'p-1.5' : 'p-4'}`}>
                         {editTab === 'FRAMES' ? (
                             <div className={`grid px-1 ${isVertical ? 'grid-cols-4 gap-1.5' : 'grid-cols-2 gap-3'}`}>
-                                {(!selectedLayoutId || frames.find(f => f.id === selectedLayoutId)?.styles.length === 0) && (
+                                {(!selectedLayoutId || frames.filter(f => f.id === selectedLayoutId).flatMap(f => f.styles).length === 0) && (
                                     <p className="col-span-4 text-white/40 italic p-4 text-center text-sm">No frames available for this layout.</p>
                                 )}
-                                {frames.find(f => f.id === selectedLayoutId)?.styles.map(style => (
-                                    <button 
-                                        key={style.id} 
-                                        onClick={() => setSelectedFrame(style)} 
-                                        className={`group relative aspect-[3/4] rounded-lg overflow-hidden transition-all transform active:scale-95 ${selectedFrame?.id === style.id ? 'ring-2 ring-[#f6cd46] ring-offset-2 ring-offset-[#0c1633] scale-[0.98]' : 'hover:scale-[1.02] opacity-80 hover:opacity-100 ring-1 ring-white/10'}`}
-                                    >
-                                        <div className="absolute inset-0 bg-white"><FrameThumbnail style={style} layoutId={selectedLayoutId || '1x1'} /></div>
-                                        {selectedFrame?.id === style.id && (
-                                            <div className="absolute top-1 right-1 bg-[#f6cd46] text-black p-0.5 rounded-full shadow-lg">
-                                                <Check size={10} strokeWidth={4} />
+                                {frames.filter(f => f.id === selectedLayoutId).flatMap(f => f.styles).map(style => {
+                                    const cfg = getEffectiveLayoutConfig(style, selectedLayoutId);
+                                    return (
+                                        <button 
+                                            key={style.id} 
+                                            onClick={() => setSelectedFrame(style)} 
+                                            className={`group relative rounded-lg overflow-hidden transition-all transform active:scale-95 ${selectedFrame?.id === style.id ? 'ring-2 ring-[#f6cd46] ring-offset-2 ring-offset-[#0c1633] scale-[0.98]' : 'hover:scale-[1.02] opacity-80 hover:opacity-100 ring-1 ring-white/10'}`}
+                                            style={{ aspectRatio: `${cfg.width} / ${cfg.height}` }}
+                                        >
+                                            <div className="absolute inset-0 bg-white"><FrameThumbnail style={style} layoutId={selectedLayoutId || '1x1'} /></div>
+                                            {selectedFrame?.id === style.id && (
+                                                <div className="absolute top-1 right-1 bg-[#f6cd46] text-black p-0.5 rounded-full shadow-lg z-10">
+                                                    <Check size={10} strokeWidth={4} />
+                                                </div>
+                                            )}
+                                            <div className="absolute bottom-0 left-0 right-0 p-1 bg-gradient-to-t from-black/80 to-transparent z-10">
+                                                <span className="text-white text-[9px] font-bold truncate block">{style.name}</span>
                                             </div>
-                                        )}
-                                        <div className="absolute bottom-0 left-0 right-0 p-1 bg-gradient-to-t from-black/80 to-transparent">
-                                            <span className="text-white text-[9px] font-bold truncate block">{style.name}</span>
-                                        </div>
-                                    </button>
-                                ))}
+                                        </button>
+                                    );
+                                })}
                             </div>
                         ) : (
                             <div className={`grid px-1 ${isVertical ? 'grid-cols-4 gap-1.5' : 'grid-cols-2 gap-3'}`}>
@@ -1706,12 +2307,6 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                         >
                             CETAK & SELESAI
                         </button>
-                        <button 
-                            onClick={handleRetake} 
-                            className={`w-full bg-white/10 hover:bg-white/20 border border-white/20 text-white rounded-xl font-bold uppercase tracking-wide transition-all active:scale-95 flex items-center justify-center gap-2 ${isVertical ? 'py-1.5 text-xs' : 'py-2.5 text-sm'}`}
-                        >
-                            <RefreshCw size={isVertical ? 12 : 14} /> Retake Photos
-                        </button>
                     </div>
                 </div>
             </div>
@@ -1735,7 +2330,18 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                          {finalUploadedUrl ? (
                              <>
                                  <div className={`bg-white rounded-2xl shadow-xl animate-fade-in ${isVertical ? 'p-2 mb-1' : 'p-5 mb-5'}`}>
-                                     <img src={`https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(finalUploadedUrl)}`} alt="QR Code" className={isVertical ? 'w-[80px] h-[80px]' : 'w-[220px] h-[220px]'} />
+                                      {(() => {
+                                        const isBase64 = finalUploadedUrl.startsWith('data:');
+                                        const downloadPageUrl = `${window.location.origin}/download.html?url=${encodeURIComponent(finalUploadedUrl)}`;
+                                        const qrTarget = encodeURIComponent(downloadPageUrl);
+                                        return (
+                                          <img
+                                            src={`https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=2&data=${qrTarget}`}
+                                            alt="QR Code"
+                                            className={isVertical ? 'w-[80px] h-[80px]' : 'w-[220px] h-[220px]'}
+                                          />
+                                        );
+                                      })()}
                                  </div>
                                  <span className={`font-black text-green-400 ${isVertical ? 'text-[10px]' : 'text-2xl mb-1 tracking-tight'}`}>Scan to Download</span>
                                  {!isVertical && <span className="text-base font-medium text-white/50">Valid for 24 hours</span>}
@@ -1787,8 +2393,8 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                  {/* Preview & actions panel – right in horizontal, bottom in vertical */}
                  <div className={`flex-1 flex flex-col items-center overflow-hidden relative ${isVertical ? 'justify-between py-3 px-4' : 'justify-center p-6 h-full'}`}>
                     {/* Preview Image */}
-                    <div className={`w-full flex items-center justify-center drop-shadow-[0_20px_50px_rgba(0,0,0,0.5)] ${isVertical ? 'flex-1 min-h-0' : 'h-full max-h-[55vh] mt-4'}`}>
-                        <PreviewComponent maxHeightStr={isVertical ? '40vh' : '55vh'} shadow={true} id="final-preview-container" />
+                    <div className={`w-full flex items-center justify-center drop-shadow-[0_20px_50px_rgba(0,0,0,0.5)] ${isVertical ? 'flex-1 min-h-0' : 'h-full max-h-[70vh] mt-4'}`}>
+                        <PreviewComponent maxHeightStr={isVertical ? '40vh' : '70vh'} shadow={true} id="final-preview-container" />
                     </div>
 
                     {/* Action Buttons */}

@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback } from 'react';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 export type GestureType = 'none' | 'pinch' | 'open_hand';
@@ -8,18 +8,14 @@ export interface CursorState { x: number; y: number; }
 export interface AirGestureState {
   cursorPos: CursorState | null;
   gesture: GestureType;
-  /** Progress 0-1 of the 3-second hold timer */
   holdProgress: number;
-  /** True when a hold-click has just been fired (for visual feedback) */
   holdFired: boolean;
-  /** Is currently pinch-scrolling */
   isPinching: boolean;
+  isScrolling: boolean;
 }
 
 export interface AirGestureCallbacks {
-  /** Called when the hold-click fires on a specific element */
   onHoldClick?: (element: Element) => void;
-  /** Called every frame during open-hand hold – useful for "start photo" trigger */
   onOpenHandHold?: (durationMs: number, element: Element | null) => void;
 }
 
@@ -28,18 +24,53 @@ interface CalibrationBox {
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const HOLD_CLICK_MS      = 3000;  // 3 s to fire hold-click
-const PINCH_CLICK_MAX_MS = 600;   // quick pinch → click
-const PINCH_CLICK_MAX_PX = 30;    // quick pinch move tolerance
-const SMOOTHING          = 0.35;  // cursor EMA (0=none, 1=frozen)
+const SMOOTHING         = 0.65;  // cursor EMA when hand open (0=raw, 1=frozen)
+
+const PINCH_ENTER_RATIO = 0.22;  // gap < 22% handSize  → pinch starts
+const PINCH_EXIT_RATIO  = 0.32;  // gap > 32% handSize  → pinch ends (hysteresis)
+
+// --- Click vs Scroll discrimination ---
+// Scroll mode ONLY activates when BOTH conditions are met:
+//   1. Pinch has been held for at least DRAG_MIN_HOLD_MS
+//   2. Hand has moved more than DRAG_THRESHOLD_PX from pinch-start
+// This prevents natural hand tremor during a click from accidentally starting scroll.
+const DRAG_THRESHOLD_PX = 55;    // px of movement required to enter scroll mode
+const DRAG_MIN_HOLD_MS  = 350;   // ms pinch must be held before scroll can activate
+
+// Max pinch duration to still fire a click
+const CLICK_MAX_MS      = 2500;
+
+// Min time between two clicks (prevent double-fire)
+const CLICK_DEBOUNCE_MS = 500;
+
+// Scroll amplification
+const SCROLL_SPEED      = 3.2;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-const dist = (a: any, b: any) => Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+const dist2D = (a: any, b: any) =>
+  Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 
 const mapRange = (v: number, lo: number, hi: number): number => {
-  const mapped   = (v - lo) / (hi - lo);
-  const expanded = (mapped - 0.5) * 1.3 + 0.5;
-  return Math.max(0, Math.min(1, expanded));
+  const c = (v - lo) / (hi - lo);
+  return Math.max(0, Math.min(1, (c - 0.5) * 1.3 + 0.5));
+};
+
+const findClickable = (el: Element | null): HTMLElement | null => {
+  if (!el) return null;
+  const found = el.closest('button, a, [role="button"], .clickable, input, label, select');
+  return found instanceof HTMLElement ? found
+       : el instanceof HTMLElement    ? el
+       : null;
+};
+
+const findScrollable = (el: Element | null): Element | null => {
+  if (!el || el === document.body) return null;
+  const s = window.getComputedStyle(el);
+  if (
+    (['auto', 'scroll'].includes(s.overflowY) || ['auto', 'scroll'].includes(s.overflow)) &&
+    el.scrollHeight > el.clientHeight
+  ) return el;
+  return findScrollable(el.parentElement);
 };
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -48,61 +79,49 @@ export function useAirGesture(
   calibrationBox: CalibrationBox,
   callbacks: AirGestureCallbacks = {}
 ) {
-  // ── Config refs – updated every render, never stale ────────────────────────
-  const enabledRef       = useRef(enabled);
-  const calibBoxRef      = useRef(calibrationBox);
-  const callbacksRef     = useRef(callbacks);
+  const enabledRef   = useRef(enabled);
+  const calibBoxRef  = useRef(calibrationBox);
+  const callbacksRef = useRef(callbacks);
+  enabledRef.current   = enabled;
+  calibBoxRef.current  = calibrationBox;
+  callbacksRef.current = callbacks;
 
-  // Update refs synchronously on every render (no useEffect delay)
-  enabledRef.current    = enabled;
-  calibBoxRef.current   = calibrationBox;
-  callbacksRef.current  = callbacks;
+  // ── Smoothed cursor for display (NOT updated during pinch) ───────────────
+  const smoothedPos   = useRef<{ x: number; y: number } | null>(null);
 
-  // ── Gesture tracking refs ──────────────────────────────────────────────────
-  const smoothedPos      = useRef<{ x: number; y: number } | null>(null);
-  const prevPos          = useRef<{ x: number; y: number } | null>(null);
+  // ── Raw/fast tracker – updated every frame including during pinch ─────────
+  // This is intentionally NOT heavily smoothed so drag deltas are responsive
+  const rawPos        = useRef<{ x: number; y: number } | null>(null);
+  const prevRawPos    = useRef<{ x: number; y: number } | null>(null);
 
-  const pinchingRef      = useRef(false);
-  const pinchStartRef    = useRef<{
-    x: number; y: number; time: number;
-    scrollTarget: Element | null; clickTarget: Element | null;
-  } | null>(null);
+  // ── Pinch state ───────────────────────────────────────────────────────────
+  const pinchingRef   = useRef(false);
+  const isDragging    = useRef(false);         // have we committed to drag mode?
+  const pinchStartMs  = useRef(0);
+  const pinchStartRaw = useRef<{ x: number; y: number } | null>(null); // raw pos at pinch start
+  const frozenCursor  = useRef<{ x: number; y: number } | null>(null); // display freeze pos
+  const clickTarget   = useRef<HTMLElement | null>(null);
+  const scrollTarget  = useRef<Element | null>(null);
+  const lastClickMs   = useRef(0);
 
-  const holdStartRef     = useRef<number | null>(null);
-  const holdElementRef   = useRef<Element | null>(null);
-  const holdFiredRef     = useRef(false);
-  const lastHoldFireRef  = useRef(0);
+  // ── Open-hand (CAPTURE trigger) ──────────────────────────────────────────
+  const holdStartRef  = useRef<number | null>(null);
 
-  // ── Exposed state ──────────────────────────────────────────────────────────
   const [state, setState] = useState<AirGestureState>({
-    cursorPos: null, gesture: 'none', holdProgress: 0, holdFired: false, isPinching: false,
+    cursorPos: null, gesture: 'none', holdProgress: 0,
+    holdFired: false, isPinching: false, isScrolling: false,
   });
 
-  // ── Scrollable parent finder ───────────────────────────────────────────────
-  const findScrollable = (el: Element | null): Element | null => {
-    if (!el || el === document.body) return null;
-    const s = window.getComputedStyle(el);
-    if (
-      (['auto', 'scroll'].includes(s.overflowY) || ['auto', 'scroll'].includes(s.overflow)) &&
-      el.scrollHeight > el.clientHeight
-    ) return el;
-    return findScrollable(el.parentElement);
-  };
-
-  // ── Main landmark processor (STABLE – never recreated) ──────────────────────
-  // Reads enabled/calibration from refs → immune to stale closure
   const processLandmarks = useCallback((landmarks: any[]) => {
-    // Always read the latest values from refs
-    const en  = enabledRef.current;
-    const box = calibBoxRef.current;
-
-    if (!en) {
+    if (!enabledRef.current) {
       smoothedPos.current = null;
-      setState(s => ({ ...s, cursorPos: null, gesture: 'none', holdProgress: 0 }));
+      rawPos.current      = null;
+      setState(s => ({ ...s, cursorPos: null, gesture: 'none' }));
       return;
     }
+    const box = calibBoxRef.current;
 
-    // ── 1. Key landmarks ────────────────────────────────────────────────────
+    // ── Landmarks ──────────────────────────────────────────────────────────
     const wrist     = landmarks[0];
     const thumbTip  = landmarks[4];
     const indexTip  = landmarks[8];
@@ -111,140 +130,172 @@ export function useAirGesture(
     const pinkyTip  = landmarks[20];
     const middleMcp = landmarks[9];
 
-    // ── 2. Map cursor position ───────────────────────────────────────────────
-    const rawX    = 1 - indexTip.x;          // mirror horizontally
-    const rawY    = indexTip.y;
-    const mappedX = mapRange(rawX, box.minX, box.maxX);
-    const mappedY = mapRange(rawY, box.minY, box.maxY);
-    const targetX = mappedX * window.innerWidth;
-    const targetY = mappedY * window.innerHeight;
+    // ── Gesture classification ────────────────────────────────────────────
+    const handSize = dist2D(wrist, middleMcp);
+    const pinchGap = dist2D(thumbTip, indexTip);
 
-    // EMA smoothing
-    if (!smoothedPos.current) {
-      smoothedPos.current = { x: targetX, y: targetY };
-    } else {
-      smoothedPos.current = {
-        x: smoothedPos.current.x * SMOOTHING + targetX * (1 - SMOOTHING),
-        y: smoothedPos.current.y * SMOOTHING + targetY * (1 - SMOOTHING),
-      };
-    }
-    const { x: cx, y: cy } = smoothedPos.current;
-
-    // ── 3. Gesture classification ────────────────────────────────────────────
-    const handSize  = dist(wrist, middleMcp);
-    const pinchDist = dist(thumbTip, indexTip);
-    const isPinchNow = pinchDist < handSize * (pinchingRef.current ? 0.35 : 0.22);
+    const isPinchNow = pinchingRef.current
+      ? pinchGap < handSize * PINCH_EXIT_RATIO
+      : pinchGap < handSize * PINCH_ENTER_RATIO;
 
     const fingerUp = (tip: any, mcp: any) => tip.y < mcp.y - handSize * 0.05;
     const isOpenHand =
       !isPinchNow &&
-      fingerUp(indexTip,  landmarks[5])  &&
-      fingerUp(middleTip, landmarks[9])  &&
+      fingerUp(indexTip,  landmarks[5]) &&
+      fingerUp(middleTip, landmarks[9]) &&
       fingerUp(ringTip,   landmarks[13]) &&
       fingerUp(pinkyTip,  landmarks[17]);
 
     const gesture: GestureType = isPinchNow ? 'pinch' : isOpenHand ? 'open_hand' : 'none';
 
-    // ── 4. Pinch ─────────────────────────────────────────────────────────────
-    if (isPinchNow) {
-      if (!pinchingRef.current) {
-        // START
-        pinchingRef.current = true;
-        const el = document.elementFromPoint(cx, cy);
-        pinchStartRef.current = { x: cx, y: cy, time: Date.now(), clickTarget: el, scrollTarget: findScrollable(el) };
-        el?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
-      } else {
-        // DRAG → scroll
-        if (prevPos.current && pinchStartRef.current) {
-          const dx    = prevPos.current.x - cx;
-          const dy    = prevPos.current.y - cy;
-          const moved = Math.sqrt((cx - pinchStartRef.current.x) ** 2 + (cy - pinchStartRef.current.y) ** 2);
-          if (moved > 20) {
-            if (pinchStartRef.current.scrollTarget) pinchStartRef.current.scrollTarget.scrollBy(dx * 2, dy * 2.5);
-            else window.scrollBy(dx * 2, dy * 2.5);
-          }
-        }
-      }
-      holdStartRef.current  = null;
-      holdFiredRef.current  = false;
-    } else {
-      if (pinchingRef.current) {
-        // END
-        pinchingRef.current = false;
-        const info  = pinchStartRef.current;
-        pinchStartRef.current = null;
-        if (info) {
-          const endEl = document.elementFromPoint(cx, cy);
-          endEl?.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
-          const dur   = Date.now() - info.time;
-          const moved = Math.sqrt((cx - info.x) ** 2 + (cy - info.y) ** 2);
-          if (dur < PINCH_CLICK_MAX_MS && moved < PINCH_CLICK_MAX_PX) {
-            const target = info.clickTarget || endEl;
-            if (target) {
-              const clickable = target.closest('button, a, input, [role="button"], .clickable');
-              (clickable instanceof HTMLElement ? clickable : target instanceof HTMLElement ? target : null)?.click();
-            }
-          }
-        }
-      }
+    // ── Raw position (lightly smoothed, always updated) ──────────────────
+    // Used for drag delta – must update every frame for accurate scrolling
+    const rawX    = 1 - indexTip.x;
+    const rawY    = indexTip.y;
+    const targetX = mapRange(rawX, box.minX, box.maxX) * window.innerWidth;
+    const targetY = mapRange(rawY, box.minY, box.maxY) * window.innerHeight;
+
+    prevRawPos.current = rawPos.current ? { ...rawPos.current } : null;
+    const RAW_SMOOTH = 0.40; // light smoothing on raw tracker
+    rawPos.current = rawPos.current
+      ? { x: rawPos.current.x * RAW_SMOOTH + targetX * (1 - RAW_SMOOTH),
+          y: rawPos.current.y * RAW_SMOOTH + targetY * (1 - RAW_SMOOTH) }
+      : { x: targetX, y: targetY };
+
+    // ── Smooth display cursor (only updated when NOT pinching) ───────────
+    if (!isPinchNow) {
+      smoothedPos.current = smoothedPos.current
+        ? { x: smoothedPos.current.x * SMOOTHING + targetX * (1 - SMOOTHING),
+            y: smoothedPos.current.y * SMOOTHING + targetY * (1 - SMOOTHING) }
+        : { x: targetX, y: targetY };
     }
 
-    // ── 5. Open-hand HOLD → 3-second click ──────────────────────────────────
-    let holdProgress = 0;
-    let holdFired    = false;
+    // ── Pinch state machine ──────────────────────────────────────────────
+    let holdFired = false;
 
-    if (isOpenHand) {
-      const el = document.elementFromPoint(cx, cy);
+    if (isPinchNow && !pinchingRef.current) {
+      // ─── PINCH START ────────────────────────────────────────────────────
+      pinchingRef.current  = true;
+      isDragging.current   = false;
+      pinchStartMs.current = Date.now();
+
+      // Freeze display cursor at current smooth position
+      frozenCursor.current  = smoothedPos.current ? { ...smoothedPos.current } : null;
+
+      // Record raw position at pinch start (for drag detection)
+      pinchStartRaw.current = rawPos.current ? { ...rawPos.current } : null;
+
+      // Record targets from frozen cursor position
+      if (frozenCursor.current) {
+        const el = document.elementFromPoint(frozenCursor.current.x, frozenCursor.current.y);
+        clickTarget.current  = findClickable(el);
+        scrollTarget.current = findScrollable(el);
+      }
+
+    } else if (isPinchNow && pinchingRef.current) {
+      // ─── STILL PINCHING ─────────────────────────────────────────────────
+
+      // Check if user has dragged enough to commit to scroll.
+      // Requires BOTH: enough time held AND enough distance moved.
+      // This prevents natural tremor during a click from triggering scroll.
+      if (!isDragging.current && rawPos.current && pinchStartRaw.current) {
+        const heldMs    = Date.now() - pinchStartMs.current;
+        const totalDrag = Math.sqrt(
+          (rawPos.current.x - pinchStartRaw.current.x) ** 2 +
+          (rawPos.current.y - pinchStartRaw.current.y) ** 2
+        );
+        if (heldMs >= DRAG_MIN_HOLD_MS && totalDrag > DRAG_THRESHOLD_PX) {
+          isDragging.current = true;
+        }
+      }
+
+      // If dragging: apply scroll based on raw frame-to-frame delta
+      if (isDragging.current && rawPos.current && prevRawPos.current) {
+        const dx = prevRawPos.current.x - rawPos.current.x;
+        const dy = prevRawPos.current.y - rawPos.current.y;
+        if (scrollTarget.current) {
+          scrollTarget.current.scrollBy(dx * SCROLL_SPEED, dy * SCROLL_SPEED);
+        } else {
+          window.scrollBy(dx * SCROLL_SPEED, dy * SCROLL_SPEED);
+        }
+      }
+
+    } else if (!isPinchNow && pinchingRef.current) {
+      // ─── PINCH RELEASE ──────────────────────────────────────────────────
+      pinchingRef.current = false;
+      const wasDragging   = isDragging.current;
+      isDragging.current  = false;
+
+      if (!wasDragging) {
+        // Short pinch, no drag → fire click
+        const now = Date.now();
+        const dur = now - pinchStartMs.current;
+        if (dur < CLICK_MAX_MS && (now - lastClickMs.current) > CLICK_DEBOUNCE_MS) {
+          const el = clickTarget.current;
+          if (el) {
+            el.click();
+            lastClickMs.current = now;
+            holdFired = true;
+          }
+        }
+      }
+      // If was dragging → no click, scroll already applied
+
+      // Unfreeze display cursor
+      frozenCursor.current  = null;
+      pinchStartRaw.current = null;
+      clickTarget.current   = null;
+      scrollTarget.current  = null;
+    }
+
+    // ── Open-hand hold (CAPTURE start trigger) ───────────────────────────
+    const displayPos = frozenCursor.current ?? smoothedPos.current;
+    if (isOpenHand && displayPos) {
       if (!holdStartRef.current) {
-        holdStartRef.current  = Date.now();
-        holdElementRef.current = el;
-        holdFiredRef.current  = false;
+        holdStartRef.current = Date.now();
       } else {
         const elapsed = Date.now() - holdStartRef.current;
-        holdProgress  = Math.min(1, elapsed / HOLD_CLICK_MS);
-
-        // Notify component every frame (used for "start photo" 1.5s trigger)
-        callbacksRef.current.onOpenHandHold?.(elapsed, el);
-
-        if (elapsed >= HOLD_CLICK_MS && !holdFiredRef.current) {
-          const now = Date.now();
-          if (now - lastHoldFireRef.current > 1000) {
-            holdFiredRef.current   = true;
-            lastHoldFireRef.current = now;
-            holdFired = true;
-            const target = holdElementRef.current || el;
-            if (target) {
-              callbacksRef.current.onHoldClick?.(target);
-              const clickable = target.closest('button, a, input, [role="button"], .clickable');
-              (clickable instanceof HTMLElement ? clickable : target instanceof HTMLElement ? target : null)?.click();
-            }
-          }
-        }
+        callbacksRef.current.onOpenHandHold?.(
+          elapsed,
+          document.elementFromPoint(displayPos.x, displayPos.y)
+        );
       }
-    } else {
+    } else if (!isOpenHand) {
       holdStartRef.current = null;
-      holdFiredRef.current = false;
     }
 
-    // ── 6. Commit state ──────────────────────────────────────────────────────
-    setState({ cursorPos: { x: cx, y: cy }, gesture, holdProgress, holdFired, isPinching: isPinchNow });
-    prevPos.current = { x: cx, y: cy };
+    // ── Commit state ─────────────────────────────────────────────────────
+    const cursorPos = frozenCursor.current ?? smoothedPos.current ?? null;
+    setState({
+      cursorPos,
+      gesture,
+      holdProgress: 0,
+      holdFired,
+      isPinching: isPinchNow,
+      isScrolling: isPinchNow && isDragging.current,
+    });
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // ← stable: no deps! reads everything from refs
+  }, []);
 
-  // ── No-hand handler (also stable) ─────────────────────────────────────────
   const processNoHand = useCallback(() => {
     smoothedPos.current   = null;
-    prevPos.current       = null;
+    rawPos.current        = null;
+    prevRawPos.current    = null;
     holdStartRef.current  = null;
-    holdFiredRef.current  = false;
+    frozenCursor.current  = null;
+    pinchStartRaw.current = null;
     if (pinchingRef.current) {
-      pinchingRef.current   = false;
-      pinchStartRef.current = null;
+      pinchingRef.current  = false;
+      isDragging.current   = false;
+      clickTarget.current  = null;
+      scrollTarget.current = null;
     }
-    setState({ cursorPos: null, gesture: 'none', holdProgress: 0, holdFired: false, isPinching: false });
-  }, []); // also stable
+    setState({
+      cursorPos: null, gesture: 'none', holdProgress: 0,
+      holdFired: false, isPinching: false, isScrolling: false,
+    });
+  }, []);
 
   return { state, processLandmarks, processNoHand };
 }

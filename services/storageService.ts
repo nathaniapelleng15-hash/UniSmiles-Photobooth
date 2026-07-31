@@ -60,6 +60,7 @@ export const uploadAsset = async (file: File): Promise<string | null> => {
 
 export const getAppConfig = (): AppConfig => {
   const stored = localStorage.getItem(STORAGE_KEYS.CONFIG);
+  const registeredKioskApiKey = localStorage.getItem('unismiles_kiosk_api_key')?.trim() || '';
   if (stored) {
     try {
       const parsed = JSON.parse(stored);
@@ -70,7 +71,7 @@ export const getAppConfig = (): AppConfig => {
           uiMode: parsed.uiMode || 'normal',
           monitorOrientation: parsed.monitorOrientation || 'horizontal',
           backendUrl: parsed.backendUrl || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
-          apiKey: parsed.apiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
+          apiKey: registeredKioskApiKey || parsed.apiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
           kioskId: parsed.kioskId || import.meta.env.VITE_KIOSK_ID || 'K-001'
       };
     } catch (e) {
@@ -84,7 +85,7 @@ export const getAppConfig = (): AppConfig => {
       uiMode: 'normal',
       monitorOrientation: 'horizontal',
       backendUrl: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
-      apiKey: import.meta.env.VITE_KIOSK_API_KEY || '',
+      apiKey: registeredKioskApiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
       kioskId: import.meta.env.VITE_KIOSK_ID || 'K-001'
   };
   saveAppConfig(defaultConfig);
@@ -385,18 +386,65 @@ export const syncFramesToDatabase = async (frames: FrameLayout[]): Promise<boole
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            // The Admin editor is the source of truth. Older code rebuilt
+            // these values from the kiosk preset and silently dropped the
+            // editor's custom canvas and slots during sync.
+            ...( (() => {
+              let editorConfig: any = (style as any)._layoutConfig ?? (style as any).layout_config;
+              if (typeof editorConfig === 'string') {
+                try { editorConfig = JSON.parse(editorConfig); } catch (_) { editorConfig = null; }
+              }
+              if (Array.isArray(editorConfig)) {
+                editorConfig = { slots: editorConfig };
+              }
+              const preset = getLayoutConfig(layout.id);
+              const width = Number(editorConfig?.width ?? editorConfig?.canvasWidth ?? (style as any).width ?? preset.width);
+              const height = Number(editorConfig?.height ?? editorConfig?.canvasHeight ?? (style as any).height ?? preset.height);
+              const slots = editorConfig?.slots ?? (style as any).slots ?? preset.slots;
+              return {
+                width,
+                height,
+                slots,
+                units: editorConfig?.units ?? editorConfig?.slotUnits ?? 'pixel',
+                slotBorder: editorConfig?.slotBorder ?? (style as any).slotBorder,
+                slotBorderColor: editorConfig?.slotBorderColor ?? (style as any).slotBorderColor,
+                slotBorderWidth: editorConfig?.slotBorderWidth ?? (style as any).slotBorderWidth
+              };
+            })() ),
             name: `${layout.label} — ${style.name}`,
             category: layout.id,
             image_url: style.overlayUrl || style.previewUrl || '',
             slot_count: layout.styles.length,
+            width: Number((style as any)._layoutConfig?.width ?? (style as any).width ?? getLayoutConfig(layout.id).width),
+            height: Number((style as any)._layoutConfig?.height ?? (style as any).height ?? getLayoutConfig(layout.id).height),
             layout_config: {
               layout_id: layout.id,
               layout_label: layout.label,
+              ...(() => {
+                let editorConfig: any = (style as any)._layoutConfig ?? (style as any).layout_config;
+                if (typeof editorConfig === 'string') {
+                  try { editorConfig = JSON.parse(editorConfig); } catch (_) { editorConfig = null; }
+                }
+                if (Array.isArray(editorConfig)) editorConfig = { slots: editorConfig };
+                const preset = getLayoutConfig(layout.id);
+                return {
+                  width: Number(editorConfig?.width ?? editorConfig?.canvasWidth ?? (style as any).width ?? preset.width),
+                  height: Number(editorConfig?.height ?? editorConfig?.canvasHeight ?? (style as any).height ?? preset.height),
+                  slots: editorConfig?.slots ?? (style as any).slots ?? preset.slots,
+                  units: editorConfig?.units ?? editorConfig?.slotUnits ?? 'pixel',
+                  slotBorder: editorConfig?.slotBorder ?? (style as any).slotBorder,
+                  slotBorderColor: editorConfig?.slotBorderColor ?? (style as any).slotBorderColor,
+                  slotBorderWidth: editorConfig?.slotBorderWidth ?? (style as any).slotBorderWidth
+                };
+              })(),
               layout_price: layout.price,
               layout_enabled: layout.enabled,
               style_id: style.id,
               backgroundConfig: style.backgroundConfig,
               elements: style.elements,
+              // Newer Admin saves uploaded logos/stickers separately from
+              // text elements. Preserve that field for the kiosk API.
+              assetElements: (style as any).assetElements ?? (style as any).asset_elements ?? [],
               previewUrl: style.previewUrl,
               overlayUrl: style.overlayUrl
             }
@@ -473,48 +521,123 @@ export const syncFromDatabase = async (): Promise<boolean> => {
       }
     }
 
-    // 2. Fetch frame templates dari backend
-    // Format response baru: { success, count, data: [{ id, name, category, image_url, slot_count, layout_config }] }
-    const framesRes = await fetch(`${baseUrl}/api/frame_templates`);
+    // 2. Fetch frame templates dari backend (/api/kiosk/templates jika ada API Key/Kiosk context, atau fallback ke /api/frame_templates)
+    let framesRes = await fetch(`${baseUrl}/api/kiosk/templates`, {
+      headers: { 'x-api-key': getAppConfig().apiKey || '' }
+    }).catch(() => null);
+
+    if (!framesRes || !framesRes.ok) {
+      framesRes = await fetch(`${baseUrl}/api/frame_templates`);
+    }
+
     let hasFramesData = false;
-    if (framesRes.ok) {
+    if (framesRes && framesRes.ok) {
       const data = await framesRes.json();
       if (data.success && data.data && data.data.length > 0) {
         hasFramesData = true;
-        // Rekonstruksi FrameLayout dari data backend
-        // layout_config berisi data lengkap yang disimpan saat syncFramesToDatabase
-        const layoutsMap = new Map<string, FrameLayout>();
 
-        for (const row of data.data) {
-          const config = typeof row.layout_config === 'string'
-            ? JSON.parse(row.layout_config)
-            : row.layout_config;
+        // Cek format data: jika mengembalikan array FrameLayout (format /api/kiosk/templates)
+        if (data.data[0] && Array.isArray(data.data[0].styles)) {
+          const frameLayouts: FrameLayout[] = data.data;
+          localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(frameLayouts));
+          console.log(`✅ ${frameLayouts.length} layout frame berhasil diambil dari /api/kiosk/templates`);
+        } else {
+          // Rekonstruksi FrameLayout dari raw data frame_templates
+          const LAYOUT_LABELS: Record<string, string> = {
+            '1x1': 'Polaroid',
+            '2x1': 'Duo Strip',
+            '3x1': 'Trio Strip',
+            '4x1': 'Film Strip',
+            '2x2': 'Classic 2x2',
+            '2x3': 'Collage 6'
+          };
+          const layoutsMap = new Map<string, FrameLayout>();
 
-          const layoutId = config.layout_id || row.category || 'unknown';
+          for (const row of data.data) {
+            const parsedConfig = typeof row.layout_config === 'string'
+              ? JSON.parse(row.layout_config || '[]')
+              : (row.layout_config || []);
+            const config = parsedConfig && typeof parsedConfig === 'object' && !Array.isArray(parsedConfig)
+              ? {
+                  ...parsedConfig,
+                  width: parsedConfig.width ?? parsedConfig.canvasWidth ?? row.width ?? row.canvas_width,
+                  height: parsedConfig.height ?? parsedConfig.canvasHeight ?? row.height ?? row.canvas_height
+                }
+              : parsedConfig;
 
-          if (!layoutsMap.has(layoutId)) {
-            layoutsMap.set(layoutId, {
-              id: layoutId,
-              label: config.layout_label || `${layoutId} Layout`,
-              enabled: config.layout_enabled !== undefined ? !!config.layout_enabled : true,
-              price: config.layout_price !== undefined ? Number(config.layout_price) : 20000,
-              styles: []
-            });
+            const layoutId = row.layout_id || (config && config.layout_id) || row.category || '1x1';
+
+            if (!layoutsMap.has(layoutId)) {
+              layoutsMap.set(layoutId, {
+                id: layoutId,
+                label: LAYOUT_LABELS[layoutId] || `${layoutId} Layout`,
+                enabled: true,
+                price: 20000,
+                styles: []
+              });
+            }
+
+            const frameType = row.frame_type || 'color';
+            const gradStopsRaw = typeof row.gradient_stops === 'string'
+              ? JSON.parse(row.gradient_stops || '[]')
+              : (row.gradient_stops || []);
+            const textElemsRaw = typeof row.text_elements === 'string'
+              ? JSON.parse(row.text_elements || '[]')
+              : (row.text_elements || []);
+
+            let backgroundConfig: any = { type: 'solid', color: row.bg_color || '#ffffff' };
+            if (frameType === 'gradient' && gradStopsRaw.length > 0) {
+              backgroundConfig = {
+                type: 'gradient',
+                gradientType: row.gradient_style || 'linear',
+                gradientAngle: row.gradient_angle ?? 45,
+                gradientStops: gradStopsRaw.map((s: any) => ({
+                  color: s.color,
+                  offset: s.position !== undefined ? s.position : (s.offset ?? 0)
+                }))
+              };
+            } else if (frameType === 'color') {
+              backgroundConfig = { type: 'solid', color: row.bg_color || '#ffffff' };
+            }
+
+            const elements = textElemsRaw.map((t: any, idx: number) => ({
+              id: t.id || `text-${idx}`,
+              type: 'text',
+              content: t.text || '',
+              x: Number(t.x ?? 50),
+              y: Number(t.y ?? 50),
+              fontSize: Number(t.fontSize || 40),
+              fontFamily: t.fontFamily || 'Inter, sans-serif',
+              color: t.color || '#FFFFFF',
+              fontWeight: t.fontWeight || 'bold',
+              opacity: 1,
+              rotation: 0
+            }));
+
+            const rawUrl = row.image_url ? row.image_url.trim() : '';
+            const imageUrl = rawUrl
+              ? (rawUrl.startsWith('http') ? rawUrl : `${baseUrl}${rawUrl}`)
+              : '';
+
+            layoutsMap.get(layoutId)!.styles.push({
+              id: String(row.id),
+              name: row.name,
+              backgroundConfig: config.backgroundConfig || config.background_config || config.background || backgroundConfig,
+              elements: config.elements || elements,
+              previewUrl: config.previewUrl || '',
+              overlayUrl: imageUrl || config.overlayUrl || '',
+              slotBorder: config.slotBorder || config.slot_border,
+              slotBorderColor: config.slotBorderColor || config.slot_border_color,
+              slotBorderWidth: config.slotBorderWidth || config.slot_border_width,
+              _accentColor: row.accent_color || '#FFFFFF',
+              _layoutConfig: config
+            } as any);
           }
 
-          layoutsMap.get(layoutId)!.styles.push({
-            id: config.style_id || String(row.id),
-            name: row.name.replace(`${config.layout_label} — `, ''),
-            backgroundConfig: config.backgroundConfig || { type: 'solid', color: '#ffffff' },
-            elements: config.elements || [],
-            previewUrl: config.previewUrl || '',
-            overlayUrl: config.overlayUrl || ''
-          });
+          const frameLayouts = Array.from(layoutsMap.values());
+          localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(frameLayouts));
+          console.log(`✅ ${frameLayouts.length} layout frame berhasil diambil dari backend`);
         }
-
-        const frameLayouts = Array.from(layoutsMap.values());
-        localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(frameLayouts));
-        console.log(`✅ ${frameLayouts.length} layout frame berhasil diambil dari backend`);
       }
     }
 

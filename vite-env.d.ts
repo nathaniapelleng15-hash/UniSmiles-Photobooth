@@ -9,6 +9,8 @@ interface ImportMetaEnv {
   readonly VITE_API_BASE_URL: string;
   /** API Key kiosk yang didapat dari Admin Dashboard */
   readonly VITE_KIOSK_API_KEY: string;
+  /** ID Kiosk (opsional) */
+  readonly VITE_KIOSK_ID?: string;
   /** Gemini API Key untuk fitur AI (opsional) */
   readonly VITE_GEMINI_API_KEY?: string;
 }
