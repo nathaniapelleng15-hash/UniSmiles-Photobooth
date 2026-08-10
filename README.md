@@ -4,8 +4,8 @@ Sistem photobooth pintar dan interaktif berbasis web yang memadukan antarmuka mo
 
 ## Ringkasan Cepat
 
-*   **Backend**: Node.js + Express (port default: `3001`)
-*   **Frontend**: React + TypeScript + Vite (dev port: `5173`)
+*   **Backend utama**: dijalankan terpisah di `http://localhost:8000`
+*   **Frontend**: React + TypeScript + Vite (dev port: `3000`)
 *   **Database**: MySQL (`unismile_db`)
 *   **Penyimpanan**: Lokal disk (folder `server/uploads/`) dan pengiriman via Gmail SMTP
 
@@ -38,13 +38,8 @@ Untuk panduan deployment lengkap dan terperinci, silakan merujuk ke dokumen [Sys
 1. Buat database baru bernama `unismile_db` di server MySQL Anda.
 2. Impor file skema database dari `server/schema.sql`.
 
-### 2. Setup Backend Server
-```bash
-cd server
-npm install
-cp .env.example .env   # Konfigurasikan kredensial DB dan Gmail di file .env
-npm start
-```
+### 2. Backend Utama
+Jalankan backend utama Uni-Smiles dari repo backend terpisah di `http://localhost:8000`. Folder `server/` di repo ini tidak dipakai untuk flow photobooth utama.
 
 ### 3. Setup Frontend App
 Buka terminal baru di root folder:
@@ -52,4 +47,12 @@ Buka terminal baru di root folder:
 npm install
 npm run dev
 ```
-Aplikasi dapat diakses di browser melalui alamat **`http://localhost:5173`**.
+Aplikasi hanya menjalankan Vite dan dapat diakses melalui **`http://localhost:3000`**.
+
+Buat `.env.local` di root frontend:
+```env
+VITE_API_BASE_URL=http://localhost:8000
+VITE_KIOSK_API_KEY=
+```
+
+Isi `VITE_KIOSK_API_KEY` dengan key asli dari Admin. Jangan menyalin placeholder. Jika kosong, key dapat dimasukkan langsung pada layar error koneksi.

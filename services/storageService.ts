@@ -1,4 +1,5 @@
 import { StickerIcon, AppConfig, STORAGE_KEYS, DEFAULT_PASSWORD, FrameLayout, PhotoFilter, VirtualBackground, GridLayoutId, FrameStyle, FrameBackground } from '../types';
+import { isUsableKioskApiKey } from './apiService';
 
 // --- CONFIGURATION ---
 // Mendapatkan URL Backend API secara dinamis dari config localStorage (agar langsung terupdate jika diubah di UI Settings)
@@ -13,49 +14,6 @@ export const getApiBaseUrl = (): string => {
   return import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 };
 
-// --- API HELPER FUNCTIONS ---
-
-/**
- * Upload aset (sticker/overlay image) ke backend.
- * Catatan: Saat ini menggunakan endpoint uploads backend lokal.
- * Saat hosting, endpoint ini akan diarahkan ke CDN.
- */
-export const uploadAsset = async (file: File): Promise<string | null> => {
-  const timestamp = Date.now();
-  const ext = file.name.split('.').pop();
-  const filename = `aset-${timestamp}.${ext}`;
-  const baseUrl = getApiBaseUrl();
-
-  const formData = new FormData();
-  const renamedFile = new File([file], filename, { type: file.type });
-  formData.append('photo', renamedFile);
-  // session_id dummy untuk aset non-sesi
-  formData.append('session_id', `ASSET-${timestamp}`);
-
-  try {
-    const response = await fetch(`${baseUrl}/api/photos`, {
-      method: 'POST',
-      body: formData
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      // Backend mengembalikan URL relatif, jadikan absolut
-      const url = data.data?.url;
-      if (url) {
-        return url.startsWith('http') ? url : `${baseUrl}${url}`;
-      }
-      return `${baseUrl}/uploads/${filename}`;
-    } else {
-      console.error('Upload aset gagal:', response.statusText);
-      return null;
-    }
-  } catch (error) {
-    console.error('Error upload aset:', error);
-    return null;
-  }
-};
-
 // --- Config / Password ---
 
 export const getAppConfig = (): AppConfig => {
@@ -64,6 +22,8 @@ export const getAppConfig = (): AppConfig => {
   if (stored) {
     try {
       const parsed = JSON.parse(stored);
+      const apiKey = [registeredKioskApiKey, parsed.apiKey, import.meta.env.VITE_KIOSK_API_KEY]
+        .find(isUsableKioskApiKey) || '';
       return {
           password: parsed.password || DEFAULT_PASSWORD,
           customSubtitle: parsed.customSubtitle || '',
@@ -71,13 +31,15 @@ export const getAppConfig = (): AppConfig => {
           uiMode: parsed.uiMode || 'normal',
           monitorOrientation: parsed.monitorOrientation || 'horizontal',
           backendUrl: parsed.backendUrl || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
-          apiKey: registeredKioskApiKey || parsed.apiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
+          apiKey,
           kioskId: parsed.kioskId || import.meta.env.VITE_KIOSK_ID || 'K-001'
       };
     } catch (e) {
       console.error('Error parsing config', e);
     }
   }
+  const apiKey = [registeredKioskApiKey, import.meta.env.VITE_KIOSK_API_KEY]
+    .find(isUsableKioskApiKey) || '';
   const defaultConfig: AppConfig = {
       password: DEFAULT_PASSWORD,
       customSubtitle: '',
@@ -85,7 +47,7 @@ export const getAppConfig = (): AppConfig => {
       uiMode: 'normal',
       monitorOrientation: 'horizontal',
       backendUrl: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
-      apiKey: registeredKioskApiKey || import.meta.env.VITE_KIOSK_API_KEY || '',
+      apiKey,
       kioskId: import.meta.env.VITE_KIOSK_ID || 'K-001'
   };
   saveAppConfig(defaultConfig);

@@ -5,9 +5,13 @@ import {
   Lock, Unlock, Scan, X, ChevronUp, ChevronDown, Loader2, Wand2, LayoutTemplate, AlertCircle, AlertTriangle
 } from 'lucide-react';
 import { FrameLayout, FrameStyle, PhotoFilter, GridLayoutId, VirtualBackground, FrameElement, STORAGE_KEYS } from '../types';
-import { getStoredFrames, getStoredFilters, getLayoutConfig, getStoredBackgrounds, getAppConfig } from '../services/storageService';
+import { getStoredFilters, getLayoutConfig, getStoredBackgrounds, getAppConfig } from '../services/storageService';
 import { useAirGesture } from './useAirGesture';
-import { startSession, completeSession, uploadPhoto, sendPhotoByEmail, fetchPaymentProfile, verifyPayment, fetchTemplates } from '../services/apiService';
+import {
+  startSession, completeSession, uploadPhoto, sendPhotoByEmail, fetchPaymentProfile,
+  verifyPayment, fetchTemplates, queuePrintJob, getPrintJobStatus, KioskApiError,
+  getApiConfig, isAutoPrintEnabled, isManualPrintFallbackEnabled
+} from '../services/apiService';
 
 // Global Scale (Now 1.0 since we removed transform scale from index.html)
 const GLOBAL_SCALE = 1.0;
@@ -35,6 +39,58 @@ interface PhotoBoothProps {
 }
 
 type BoothStep = 'LANDING' | 'PACKAGE' | 'LAYOUT' | 'PAYMENT' | 'CAPTURE' | 'EDIT' | 'RESULT';
+type PrintState = 'idle' | 'preparing' | 'uploading' | 'queued' | 'printing' | 'success' | 'failed';
+
+const ACTIVE_PRINT_STORAGE_KEY = 'unismiles_active_print_job';
+const PRINT_POLL_TIMEOUT_MS = 60_000;
+
+interface PersistedPrintJob {
+  sessionCode: string;
+  jobId: string;
+  imageUrl: string;
+  idempotencyKey: string;
+  status: 'queued' | 'printing';
+  createdAt: number;
+}
+
+const makeIdempotencyKey = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `print-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+};
+
+const getPersistedPrintJob = (): PersistedPrintJob | null => {
+  try {
+    const raw = sessionStorage.getItem(ACTIVE_PRINT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedPrintJob;
+    if (!parsed.sessionCode || !parsed.jobId || !parsed.imageUrl || !parsed.idempotencyKey) return null;
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+};
+
+const persistPrintJob = (job: PersistedPrintJob): void => {
+  try { sessionStorage.setItem(ACTIVE_PRINT_STORAGE_KEY, JSON.stringify(job)); } catch (_) { /* optional recovery only */ }
+};
+
+const clearPersistedPrintJob = (): void => {
+  try { sessionStorage.removeItem(ACTIVE_PRINT_STORAGE_KEY); } catch (_) { /* optional recovery only */ }
+};
+
+const getPrintErrorMessage = (error: unknown): string => {
+  const status = error instanceof KioskApiError ? error.status : undefined;
+  switch (status) {
+    case 401: return 'Kiosk API key tidak valid. Periksa konfigurasi kiosk.';
+    case 403: return 'Kiosk sedang offline atau tidak memiliki izin mencetak.';
+    case 404: return 'Sesi, job print, atau gambar final tidak ditemukan.';
+    case 409: return 'Permintaan print ditolak karena konflik sesi. Silakan coba lagi.';
+    case 500: return 'Server print sedang bermasalah. Silakan coba lagi.';
+    default: return 'Print gagal. Periksa koneksi kiosk dan kondisi printer, lalu coba lagi.';
+  }
+};
 
 // Harga bisa dikirim backend sebagai `price`, `layout_price`, atau di dalam
 // layout_config (format lama). Jangan gunakan harga UI sebagai sumber payment.
@@ -82,8 +138,7 @@ const bustFrameAssetCache = (url: string | undefined): string | undefined => {
 const resolveFrameAssetUrl = (value: unknown): string => {
   if (typeof value !== 'string' || !value) return '';
   if (/^(data:|blob:|https?:\/\/)/i.test(value)) return value;
-  const backend = (getAppConfig().backendUrl || 'http://localhost:8000').replace(/\/$/, '');
-  const root = backend.replace(/\/api\/v1(?:\/(?:kiosk|admin))?$/, '');
+  const root = getApiConfig().baseUrl;
   return value.startsWith('/') ? `${root}${value}` : `${root}/${value}`;
 };
 
@@ -226,6 +281,10 @@ const normalizeTemplatePrices = (templates: any[]): FrameLayout[] => templates.m
 // --- OPTIMIZATION: Global Image Cache ---
 // Stores URL -> Base64 mapping to prevent re-fetching same assets
 const imageCache = new Map<string, string>();
+const ASSET_FETCH_TIMEOUT_MS = 4000;
+const ASSET_PROXY_TIMEOUT_MS = 2500;
+const ASSET_PROCESSING_TIMEOUT_MS = 8000;
+const RENDER_IMAGE_TIMEOUT_MS = 6000;
 
 // --- Helper: Robust Image to Base64 with Timeout & Cache ---
 const convertImageToBase64 = async (url: string): Promise<string> => {
@@ -234,7 +293,7 @@ const convertImageToBase64 = async (url: string): Promise<string> => {
   if (imageCache.has(url)) return imageCache.get(url)!;
 
   // Helper to fetch with timeout and convert to base64
-  const fetchAndConvert = async (targetUrl: string, timeout = 5000): Promise<string> => {
+  const fetchAndConvert = async (targetUrl: string, timeout = ASSET_FETCH_TIMEOUT_MS): Promise<string> => {
       const controller = new AbortController();
       const id = setTimeout(() => controller.abort(), timeout);
       try {
@@ -266,9 +325,11 @@ const convertImageToBase64 = async (url: string): Promise<string> => {
   const imageObjectLoad = (targetUrl: string): Promise<string> => {
       return new Promise((resolve, reject) => {
           const img = new Image();
+          const timeoutId = window.setTimeout(() => reject(new Error('Image load timeout')), ASSET_FETCH_TIMEOUT_MS);
           img.crossOrigin = 'Anonymous'; // Required for toDataURL
           img.referrerPolicy = 'no-referrer'; 
           img.onload = () => {
+              window.clearTimeout(timeoutId);
               const canvas = document.createElement('canvas');
               canvas.width = img.width;
               canvas.height = img.height;
@@ -280,7 +341,10 @@ const convertImageToBase64 = async (url: string): Promise<string> => {
                   resolve(data);
               } catch (e) { reject(e); } // Likely tainted canvas
           };
-          img.onerror = (e) => reject(new Error('Image load error'));
+          img.onerror = () => {
+              window.clearTimeout(timeoutId);
+              reject(new Error('Image load error'));
+          };
           img.src = targetUrl;
       });
   };
@@ -306,15 +370,14 @@ const convertImageToBase64 = async (url: string): Promise<string> => {
 
   // 2. Try Proxies if direct failed
   if (!resultBase64) {
-      for (const proxyGen of PROXIES) {
+      const proxyResults = await Promise.all(PROXIES.map(async proxyGen => {
           try {
-              const proxyUrl = proxyGen(url);
-              resultBase64 = await fetchAndConvert(proxyUrl);
-              if (resultBase64) break; // Success!
-          } catch (e) {
-              // Continue to next proxy
+              return await fetchAndConvert(proxyGen(url), ASSET_PROXY_TIMEOUT_MS);
+          } catch (_) {
+              return null;
           }
-      }
+      }));
+      resultBase64 = proxyResults.find(Boolean) || null;
   }
 
   // 3. Last Resort: Image Object Load (bypass fetch API restrictions)
@@ -629,6 +692,16 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [processedFrame, setProcessedFrame] = useState<FrameStyle | null>(null);
   const [areAssetsReady, setAreAssetsReady] = useState(false);
   
+  // Automatic print state. The ref closes the small gap before React re-renders
+  // so a double-click cannot queue two jobs.
+  const [printState, setPrintState] = useState<PrintState>('idle');
+  const [printJobId, setPrintJobId] = useState<string | null>(null);
+  const [printError, setPrintError] = useState<string | null>(null);
+  const printActionInFlightRef = useRef(false);
+  const printPollTokenRef = useRef(0);
+  const printPollTimerRef = useRef<number | null>(null);
+  const isPrintActive = ['preparing', 'uploading', 'queued', 'printing'].includes(printState);
+  
   const [backgrounds, setBackgrounds] = useState<VirtualBackground[]>([]);
   const [selectedBackground, setSelectedBackground] = useState<VirtualBackground | null>(null);
   const [frames, setFrames] = useState<FrameLayout[]>([]);
@@ -730,23 +803,47 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const [qrisUrl, setQrisUrl] = useState<string | null>(null);
   const [qrisLoading, setQrisLoading] = useState(false);
   const [finalUploadedUrl, setFinalUploadedUrl] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  const [flowError, setFlowError] = useState<string | null>(null);
   // Harga dari response start session adalah harga authoritative dari backend.
   const [sessionAmount, setSessionAmount] = useState<number | null>(null);
+  // Keep email sending and the automatic upload on the same promise. Without
+  // this, a visitor can submit the email while the backend still has no photo
+  // attached to the session.
+  const finalPhotoUploadPromiseRef = useRef<Promise<string | null> | null>(null);
+  const sessionCompletedRef = useRef(false);
+
+  const ensureSessionCompleted = async () => {
+    if (!sessionCode) throw new KioskApiError('Sesi belum dibuat.');
+    if (sessionCompletedRef.current && downloadUrl) {
+      return { success: true as const, downloadUrl };
+    }
+    const completed = await completeSession(sessionCode);
+    sessionCompletedRef.current = true;
+    setDownloadUrl(completed.downloadUrl);
+    return completed;
+  };
 
   const refreshFrames = useCallback(async () => {
-    const templates = await fetchTemplates();
-    if (!templates || templates.length === 0) return false;
-
-    const freshFrames = normalizeTemplatePrices(templates);
-    localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(freshFrames));
-    setFrames(freshFrames);
-    return true;
+    try {
+      const templates = await fetchTemplates();
+      const freshFrames = normalizeTemplatePrices(templates);
+      localStorage.setItem(STORAGE_KEYS.FRAMES, JSON.stringify(freshFrames));
+      setFrames(freshFrames);
+      setTemplateError(null);
+      return true;
+    } catch (error) {
+      const message = error instanceof KioskApiError ? error.message : 'Template gagal dimuat dari backend utama.';
+      setFrames([]);
+      setTemplateError(message);
+      return false;
+    }
   }, []);
 
   useEffect(() => {
-    refreshFrames().then((loaded) => {
-      if (!loaded) setFrames(getStoredFrames());
-    });
+    void refreshFrames();
 
     const allFilters = getStoredFilters().filter(f => f.enabled);
     setFilters(allFilters);
@@ -787,10 +884,10 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   }, [refreshFrames]);
 
   // Admin updates can happen while the kiosk page stays open. Refresh when
-  // the tab is revisited and periodically while it remains visible.
+  // the kiosk is idle; never replace frame data during an active photo flow.
   useEffect(() => {
     const refreshWhenVisible = () => {
-      if (document.visibilityState === 'visible') refreshFrames();
+      if (document.visibilityState === 'visible' && step === 'LANDING') refreshFrames();
     };
     document.addEventListener('visibilitychange', refreshWhenVisible);
     window.addEventListener('focus', refreshWhenVisible);
@@ -800,7 +897,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       window.removeEventListener('focus', refreshWhenVisible);
       window.clearInterval(interval);
     };
-  }, [refreshFrames]);
+  }, [refreshFrames, step]);
 
   // Keep the main preview tied to the currently selected layout and the latest
   // Admin response. Previously a frame from the previous layout could remain
@@ -822,9 +919,18 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   // --- OPTIMIZATION: Process Frame Assets to Base64 ---
   useEffect(() => {
     let isMounted = true;
+    let safetyTimeout: number | null = null;
+    const clearSafetyTimeout = () => {
+        if (safetyTimeout !== null) {
+            window.clearTimeout(safetyTimeout);
+            safetyTimeout = null;
+        }
+    };
+
     const processFrameAssets = async () => {
         // Validation checks
         if (!selectedFrame) {
+            clearSafetyTimeout();
             if (isMounted) {
                 setProcessedFrame(null);
                 setAreAssetsReady(true);
@@ -834,6 +940,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
         
         // Only run when entering RESULT step
         if (step !== 'RESULT') {
+            clearSafetyTimeout();
             if (isMounted) {
                 if (areAssetsReady) setAreAssetsReady(false);
                 if (processedFrame) setProcessedFrame(null);
@@ -843,11 +950,13 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
 
         // Optimization: Avoid re-processing if ID is identical
         if (processedFrame?.id === selectedFrame.id && areAssetsReady) {
+            clearSafetyTimeout();
             return;
         }
 
         // Optimization: If no elements, no need to process
         if (!selectedFrame.elements || selectedFrame.elements.length === 0) {
+             clearSafetyTimeout();
              if (isMounted) {
                 setProcessedFrame(selectedFrame);
                 setAreAssetsReady(true);
@@ -890,6 +999,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
             }
 
             if (isMounted) {
+                clearSafetyTimeout();
                 newFrame.elements = newElements;
                 setProcessedFrame(newFrame);
                 // Force ready
@@ -901,27 +1011,29 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
             console.error("Asset processing failed globally", e);
             // Critical Fail-safe: Allow user to proceed with raw URLs
             if (isMounted) {
+                clearSafetyTimeout();
                 setProcessedFrame(selectedFrame); // Fallback to raw frame
                 setAreAssetsReady(true); 
-                setUploadStatus('error');
+                setUploadStatus('idle');
             }
         }
     };
 
-    // Safety Timeout: If processing takes > 10 seconds, force ready state
-    const safetyTimeout = setTimeout(() => {
-        if (step === 'RESULT' && !areAssetsReady && isMounted) {
+    // Safety Timeout: do not leave the result screen blocked by a remote asset.
+    safetyTimeout = window.setTimeout(() => {
+        if (step === 'RESULT' && isMounted) {
             console.warn("Asset processing timed out. Forcing ready state.");
+            setProcessedFrame(current => current || selectedFrame);
             setAreAssetsReady(true);
             setUploadStatus('idle');
         }
-    }, 10000);
+    }, ASSET_PROCESSING_TIMEOUT_MS);
 
     processFrameAssets();
 
     return () => {
         isMounted = false;
-        clearTimeout(safetyTimeout);
+        clearSafetyTimeout();
     };
   }, [selectedFrame, step]); // Removed extra deps to prevent looping
 
@@ -1185,6 +1297,10 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
 
   // --- Actions ---
   const handleStart = () => {
+      if (frames.length === 0) {
+        setFlowError(templateError || 'Template belum tersedia dari backend utama.');
+        return;
+      }
       // Ensure state is clear when starting fresh
       setSelectedPackage(null);
       setCapturedPhotos([]);
@@ -1194,8 +1310,22 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       setReviewPhotoIndex(null);
       setCaptureExpired(false);
       setFinalUploadedUrl(null);
+      setDownloadUrl(null);
+      setUploadError(null);
+      setFlowError(null);
+      setTemplateError(null);
+      setSessionCode('');
       setProcessedFrame(null);
       setSessionAmount(null);
+      setPrintState('idle');
+      setPrintJobId(null);
+      setPrintError(null);
+      printActionInFlightRef.current = false;
+      printPollTokenRef.current += 1;
+      if (printPollTimerRef.current !== null) window.clearTimeout(printPollTimerRef.current);
+      clearPersistedPrintJob();
+      finalPhotoUploadPromiseRef.current = null;
+      sessionCompletedRef.current = false;
       setStep('PACKAGE');
   };
   const handlePackageSelect = (pkg: 'print' | 'digital') => {
@@ -1203,6 +1333,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       setStep('LAYOUT');
   };
   const handleLayoutSelect = async (id: GridLayoutId) => { 
+    setFlowError(null);
     setSelectedLayoutId(id); 
     const availableStyles = frames.filter(frame => frame.id === id).flatMap(frame => frame.styles);
     // Select the first style of the new layout immediately. Do not leave the
@@ -1218,32 +1349,33 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     setReviewPhotoIndex(null);
     setCaptureExpired(false);
     
-    // Mulai session di database backend
     const kioskId = getAppConfig().kioskId || 'K-001';
-    const selectedLayout = frames.find(frame => frame.id === id);
-    const templateId = Number(selectedLayout?.styles?.[0]?.id);
-    const sessionData = await startSession(
-      kioskId,
-      Number.isInteger(templateId) && templateId > 0 ? templateId : null
-    ).catch(err => console.warn('⚠️ Gagal daftarkan sesi ke DB:', err));
-    if (sessionData && (sessionData as any).id) {
-       setSessionCode((sessionData as any).id);
-       setSessionAmount(sessionData.amount ?? null);
+    const selectedTemplate = availableStyles[0] as any;
+    const templateId = Number(
+      selectedTemplate?.template_id
+      ?? selectedTemplate?.templateId
+      ?? selectedTemplate?.id
+    );
+
+    try {
+      const sessionData = await startSession(kioskId, templateId);
+      setSessionCode(sessionData.id);
+      setSessionAmount(sessionData.amount ?? null);
+      setStep('PAYMENT');
+    } catch (error) {
+      const message = error instanceof KioskApiError ? error.message : 'Sesi gagal dibuat di backend utama.';
+      setFlowError(message);
     }
-    
-    setStep('PAYMENT'); 
   };
   const handlePaymentConfirm = async () => {
+    setFlowError(null);
     try {
-      const verified = await verifyPayment(sessionCode);
-      if (!verified) {
-          alert('Pembayaran belum diterima atau gagal diverifikasi.');
-          return;
-      }
-    } catch (e) {
-      console.error('Failed to log transaction:', e);
+      await verifyPayment(sessionCode);
+      setStep('CAPTURE');
+    } catch (error) {
+      const message = error instanceof KioskApiError ? error.message : 'Pembayaran gagal dikonfirmasi backend.';
+      setFlowError(message);
     }
-    setStep('CAPTURE');
   };
   const handleFinish = () => { 
     setStep('RESULT'); 
@@ -1338,6 +1470,18 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     setStep('CAPTURE'); 
     setUploadStatus('idle'); 
     setFinalUploadedUrl(null); 
+    setDownloadUrl(null);
+    setUploadError(null);
+    setFlowError(null);
+    setPrintState('idle');
+    setPrintJobId(null);
+    setPrintError(null);
+    printActionInFlightRef.current = false;
+    printPollTokenRef.current += 1;
+    if (printPollTimerRef.current !== null) window.clearTimeout(printPollTimerRef.current);
+    clearPersistedPrintJob();
+    finalPhotoUploadPromiseRef.current = null;
+    sessionCompletedRef.current = false;
     setIsSent(false); 
     setProcessedFrame(null);
     setEmail('');
@@ -1373,9 +1517,6 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const handleHome = () => {
       // Soft Reset: Clear all state to initial values instead of forcing a page reload
       // This prevents black screen issues and feels faster
-      if (sessionCode) {
-         completeSession(sessionCode).catch(e => console.error(e));
-      }
       setCapturedPhotos([]);
       setRetakeIndex(null);
       setReviewPhotoIndex(null);
@@ -1389,7 +1530,19 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       setProcessedFrame(null);
       setAreAssetsReady(false);
       setFinalUploadedUrl(null);
+      setDownloadUrl(null);
+      setUploadError(null);
+      setFlowError(null);
       setUploadStatus('idle');
+      setPrintState('idle');
+      setPrintJobId(null);
+      setPrintError(null);
+      printActionInFlightRef.current = false;
+      printPollTokenRef.current += 1;
+      if (printPollTimerRef.current !== null) window.clearTimeout(printPollTimerRef.current);
+      clearPersistedPrintJob();
+      finalPhotoUploadPromiseRef.current = null;
+      sessionCompletedRef.current = false;
       setEmail('');
       setEmailError(null);
       setIsSent(false);
@@ -1404,16 +1557,40 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       setEmailError('Email tidak boleh kosong');
       return;
     }
+    if (!sessionCode) {
+      setEmailError('Sesi foto belum siap. Silakan coba lagi.');
+      return;
+    }
     setIsSending(true);
     setEmailError(null);
     try {
-      // Panggil sendPhotoByEmail baru
-      const success = await sendPhotoByEmail(sessionCode, email);
+      // Do not call the mail endpoint until every photo is persisted and the
+      // backend has returned the session download URL.
+      let photoUrl = finalUploadedUrl?.startsWith('http')
+        ? finalUploadedUrl
+        : await doAutoUpload();
 
-      if (success) {
+      // A failed attempt is retryable from the same result screen.
+      if (!photoUrl) {
+        finalPhotoUploadPromiseRef.current = null;
+        setFinalUploadedUrl(null);
+        photoUrl = await doAutoUpload();
+      }
+
+      if (!photoUrl) {
+        throw new Error('Foto belum berhasil diupload ke server. Silakan coba lagi.');
+      }
+
+      if (!sessionCompletedRef.current) {
+        await ensureSessionCompleted();
+      }
+
+      const res = await sendPhotoByEmail(sessionCode, email.trim());
+
+      if (res.success) {
         setIsSent(true);
       } else {
-        throw new Error('Gagal mengirim email. Silakan periksa koneksi internet kiosk.');
+        throw new Error(res.message || 'Gagal mengirim email. Silakan periksa koneksi internet kiosk.');
       }
     } catch (err: any) {
       console.error('Email send error:', err);
@@ -1432,8 +1609,15 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     const loadImg = (src: string): Promise<HTMLImageElement> =>
       new Promise((resolve, reject) => {
         const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = reject;
+        const timeoutId = window.setTimeout(() => reject(new Error('Render image load timeout')), RENDER_IMAGE_TIMEOUT_MS);
+        img.onload = () => {
+          window.clearTimeout(timeoutId);
+          resolve(img);
+        };
+        img.onerror = () => {
+          window.clearTimeout(timeoutId);
+          reject(new Error('Render image load error'));
+        };
         img.src = src;
       });
 
@@ -1577,52 +1761,50 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     }
   };
 
-  const doAutoUpload = async () => {
-      try {
+  const doAutoUpload = async (): Promise<string | null> => {
+      if (finalPhotoUploadPromiseRef.current) {
+          return finalPhotoUploadPromiseRef.current;
+      }
+
+      const uploadPromise = (async (): Promise<string | null> => {
+        try {
+          if (!sessionCode) throw new KioskApiError('Sesi belum dibuat di backend.');
+          if (capturedPhotos.length === 0) throw new KioskApiError('Tidak ada foto untuk diupload.');
+
           setUploadStatus('uploading');
-          await new Promise(r => setTimeout(r, 100));
-          
-          const element = document.getElementById('final-preview-container');
-          if (element) {
-              const imgs = element.getElementsByTagName('img');
-              await Promise.all(Array.from(imgs).map(img => {
-                  if (img.complete) return Promise.resolve();
-                  return new Promise((resolve) => { 
-                      img.onload = resolve; 
-                      img.onerror = resolve; 
-                  });
-              }));
+          setUploadError(null);
+          setFinalUploadedUrl(null);
+          setDownloadUrl(null);
+
+          // Raw photos must be stored before the final strip/frame.
+          for (let i = 0; i < capturedPhotos.length; i += 1) {
+              const rawResponse = await fetch(capturedPhotos[i]);
+              const rawBlob = await rawResponse.blob();
+              await uploadPhoto(rawBlob, sessionCode, `${sessionCode}_single_${i + 1}.png`);
           }
 
           const dataUrl = await generateCompositeImage();
-          if (!dataUrl) throw new Error("Generation failed");
+          if (!dataUrl) throw new KioskApiError('Frame final gagal dibuat.');
+          const finalResponse = await fetch(dataUrl);
+          const finalBlob = await finalResponse.blob();
+          const serverUrl = await uploadPhoto(finalBlob, sessionCode, `${sessionCode}_frame.png`);
+          setFinalUploadedUrl(serverUrl);
 
-          // Simpan base64 lokal dulu — ini yang akan dipakai email jika upload gagal
-          setFinalUploadedUrl(dataUrl);
+          const completed = await ensureSessionCompleted();
+          setDownloadUrl(completed.downloadUrl);
           setUploadStatus('success');
+          return serverUrl;
 
-          // Coba upload ke backend (opsional — tidak crash jika gagal)
-          try {
-              const res = await fetch(dataUrl);
-              const blob = await res.blob();
-              
-              // Upload foto menggunakan apiService
-              const serverUrl = await uploadPhoto(blob, sessionCode, `${sessionCode}.png`);
-              
-              if (serverUrl) {
-                  setFinalUploadedUrl(serverUrl);
-                  console.log('✅ Foto berhasil diupload ke server:', serverUrl);
-              } else {
-                  throw new Error('Upload gagal');
-              }
-          } catch (uploadErr) {
-              // Backend tidak tersedia — pakai base64 lokal (sudah di-set di atas)
-              console.warn('⚠️ Upload ke backend gagal, menggunakan base64 lokal:', uploadErr);
-          }
-      } catch (error) {
-          console.error(error);
+        } catch (error) {
+          console.error('doAutoUpload Error:', error);
+          setUploadError(error instanceof KioskApiError ? error.message : 'Upload foto ke backend gagal.');
           setUploadStatus('error');
-      }
+          return null;
+        }
+      })();
+
+      finalPhotoUploadPromiseRef.current = uploadPromise;
+      return uploadPromise;
   };
 
   useEffect(() => {
@@ -1638,6 +1820,9 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
       setQrisLoading(true);
       fetchPaymentProfile()
         .then(url => { if (url) setQrisUrl(url); })
+        .catch(error => {
+          setFlowError(error instanceof KioskApiError ? error.message : 'QRIS gagal dimuat dari backend utama.');
+        })
         .finally(() => setQrisLoading(false));
     }
   }, [step]);
@@ -1655,6 +1840,10 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
   const handleDownload = async () => {
       if (!areAssetsReady) {
           alert("Please wait for assets to load fully.");
+          return;
+      }
+      if (!finalUploadedUrl?.startsWith('http')) {
+          alert(uploadError || 'Foto belum tersimpan di backend. Silakan tunggu upload selesai.');
           return;
       }
 
@@ -1680,72 +1869,187 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
           }
       }
 
-      // Fallback: generate ulang dari DOM
-      const dataUrl = await generateCompositeImage();
-      if (dataUrl) {
-          const link = document.createElement('a');
-          link.href = dataUrl;
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-      }
+      alert('Download foto gagal. Coba lagi setelah koneksi backend stabil.');
   };
 
-  const handlePrint = async () => {
+  const finishPrintAsFailed = (error: unknown): void => {
+      printActionInFlightRef.current = false;
+      clearPersistedPrintJob();
+      setPrintState('failed');
+      setPrintError(getPrintErrorMessage(error));
+      // Keep session lifecycle independent from printer availability.
+      void ensureSessionCompleted();
+  };
+
+  const startPrintPolling = useCallback((jobId: string) => {
+      const token = ++printPollTokenRef.current;
+      if (printPollTimerRef.current !== null) window.clearTimeout(printPollTimerRef.current);
+
+      const poll = async () => {
+          const startedAt = Date.now();
+          while (printPollTokenRef.current === token && Date.now() - startedAt <= PRINT_POLL_TIMEOUT_MS) {
+              try {
+                  const job = await getPrintJobStatus(jobId);
+                  if (printPollTokenRef.current !== token) return;
+
+                  setPrintJobId(job.job_id);
+                  setPrintState(job.status);
+                  if (job.status === 'success') {
+                      printActionInFlightRef.current = false;
+                      clearPersistedPrintJob();
+                      setPrintError(null);
+                      return;
+                  }
+                  if (job.status === 'failed') {
+                      finishPrintAsFailed(new Error('Printer menolak print job.'));
+                      return;
+                  }
+              } catch (error) {
+                  if (printPollTokenRef.current !== token) return;
+                  finishPrintAsFailed(error);
+                  return;
+              }
+
+              await new Promise<void>(resolve => {
+                  printPollTimerRef.current = window.setTimeout(resolve, 1000);
+              });
+          }
+
+          if (printPollTokenRef.current === token) {
+              finishPrintAsFailed(new Error('Print timeout.'));
+          }
+      };
+
+      void poll();
+  }, []);
+
+  const handleManualPrint = async () => {
       if (!areAssetsReady) {
-          alert("Wait for assets...");
+          alert('Tunggu sampai hasil foto selesai diproses.');
           return;
       }
-      const dataUrl = await generateCompositeImage();
-      if (dataUrl) {
-          // Hitung dimensi fisik cetak berdasarkan layout
-          // Keep the physical print ratio aligned with the admin canvas too.
-          // The generated image already uses the exact admin pixel dimensions.
+
+      try {
+          // Manual fallback remains an explicit user action and uses the same
+          // final composited image as automatic printing.
+          const imageUrl = finalUploadedUrl || await generateCompositeImage();
+          if (!imageUrl) throw new Error('Foto final belum tersedia.');
+
           const printConfig = getEffectiveLayoutConfig(processedFrame || selectedFrame, selectedLayoutId);
           const printHeight = 6;
           const printWidth = printHeight * (printConfig.width / printConfig.height);
-          const size = { w: `${printWidth}in`, h: `${printHeight}in` };
-
           const win = window.open('', '_blank');
-          if (win) {
-              win.document.write(`
-                  <html>
-                  <head>
-                    <title>UniSmile Photo Print</title>
-                    <style>
-                      @page {
-                        size: ${size.w} ${size.h};
-                        margin: 0;
-                      }
-                      * { margin: 0; padding: 0; box-sizing: border-box; }
-                      body {
-                        width: ${size.w};
-                        height: ${size.h};
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        background: #fff;
-                      }
-                      img {
-                        width: ${size.w};
-                        height: ${size.h};
-                        object-fit: contain;
-                        display: block;
-                      }
-                    </style>
-                  </head>
-                  <body>
-                    <img src="${dataUrl}" />
-                  </body>
-                  </html>
-              `);
-              win.document.close();
-              win.focus();
-              setTimeout(() => { win.print(); }, 800);
-          }
+          if (!win) throw new Error('Jendela print diblokir browser.');
+          win.document.title = 'UniSmile Photo Print';
+          const style = win.document.createElement('style');
+          style.textContent = `@page { size: ${printWidth}in ${printHeight}in; margin: 0; } * { margin: 0; padding: 0; box-sizing: border-box; } body { width: ${printWidth}in; height: ${printHeight}in; display: flex; align-items: center; justify-content: center; background: #fff; } img { width: ${printWidth}in; height: ${printHeight}in; object-fit: contain; display: block; }`;
+          win.document.head.appendChild(style);
+          const image = win.document.createElement('img');
+          image.src = imageUrl;
+          image.onload = () => { win.focus(); win.print(); };
+          win.document.body.appendChild(image);
+      } catch (error) {
+          setPrintError('Print manual tidak dapat dibuka. Izinkan popup lalu coba lagi.');
+          setPrintState('failed');
       }
   };
+
+  const handleAutoPrint = async () => {
+      if (printActionInFlightRef.current || isPrintActive || printState === 'success') return;
+      if (!areAssetsReady || !sessionCode) {
+          setPrintError(!sessionCode ? 'Sesi foto belum tersedia.' : 'Tunggu sampai hasil foto selesai diproses.');
+          setPrintState('failed');
+          return;
+      }
+
+      printActionInFlightRef.current = true;
+      setPrintError(null);
+      setPrintState('preparing');
+
+      try {
+          // Recover an already-created job after a refresh/re-render rather
+          // than creating a second physical print.
+          const existingJob = getPersistedPrintJob();
+          if (existingJob && existingJob.sessionCode === sessionCode) {
+              setPrintJobId(existingJob.jobId);
+              setPrintState(existingJob.status);
+              startPrintPolling(existingJob.jobId);
+              return;
+          }
+
+          let imageUrl = finalUploadedUrl?.startsWith('http') ? finalUploadedUrl : null;
+          if (!imageUrl) {
+              // A previous upload failure is retryable. Do not reuse the
+              // already-resolved rejected/null promise on the next click.
+              if (uploadStatus === 'error') {
+                  finalPhotoUploadPromiseRef.current = null;
+                  setUploadStatus('idle');
+              }
+              setPrintState('uploading');
+              imageUrl = await doAutoUpload();
+          }
+          if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) {
+              throw new Error('Image final belum tersedia di server.');
+          }
+
+          const printConfig = getEffectiveLayoutConfig(processedFrame || selectedFrame, selectedLayoutId);
+          const idempotencyKey = makeIdempotencyKey();
+          const job = await queuePrintJob(sessionCode, {
+              image_url: imageUrl,
+              copies: 1,
+              paper_size: '4R',
+              orientation: printConfig.width > printConfig.height ? 'landscape' : 'portrait',
+              idempotency_key: idempotencyKey
+          });
+
+          setPrintJobId(job.job_id);
+          setPrintState(job.status);
+          persistPrintJob({
+              sessionCode,
+              jobId: job.job_id,
+              imageUrl,
+              idempotencyKey,
+              status: job.status === 'printing' ? 'printing' : 'queued',
+              createdAt: Date.now()
+          });
+          startPrintPolling(job.job_id);
+      } catch (error) {
+          console.error('[PhotoBooth] Automatic print request failed:', error instanceof KioskApiError ? error.message : 'request error');
+          finishPrintAsFailed(error);
+      }
+  };
+
+  const handlePrint = () => {
+      if (isAutoPrintEnabled()) {
+          void handleAutoPrint();
+      } else {
+          void handleManualPrint();
+      }
+  };
+
+  useEffect(() => () => {
+      printPollTokenRef.current += 1;
+      if (printPollTimerRef.current !== null) window.clearTimeout(printPollTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+      const saved = getPersistedPrintJob();
+      if (!saved || Date.now() - saved.createdAt > 24 * 60 * 60 * 1000) {
+          if (saved) clearPersistedPrintJob();
+          return;
+      }
+
+      // Restore only the trackable print record. No API key or credential is
+      // persisted here; the existing kiosk auth path is used by polling.
+      setSessionCode(saved.sessionCode);
+      setFinalUploadedUrl(saved.imageUrl);
+      setPrintJobId(saved.jobId);
+      setPrintState(saved.status);
+      setSelectedPackage('print');
+      setStep('RESULT');
+      printActionInFlightRef.current = true;
+      startPrintPolling(saved.jobId);
+  }, [startPrintPolling]);
 
   // --- Rendering Helpers ---
   const PreviewComponent = ({ shadow = true, maxHeightStr = '65vh', id }: { shadow?: boolean, maxHeightStr?: string, id?: string }) => {
@@ -1753,6 +2057,13 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
     // photo is captured. Only the layout selection is required to render the
     // frame preview; an empty photo array is a valid initial state.
     if (!selectedLayoutId) {
+        if (finalUploadedUrl?.startsWith('http')) {
+            return (
+                <div className="flex items-center justify-center h-full w-full bg-white rounded-xl p-4">
+                    <img src={finalUploadedUrl} alt="Final photo" className="max-h-full max-w-full object-contain" />
+                </div>
+            );
+        }
         return (
             <div className="flex flex-col items-center justify-center h-full w-full bg-white/5 rounded-xl p-12 text-center text-white">
                 <AlertCircle size={48} className="text-red-400 mb-4" />
@@ -1776,7 +2087,11 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                 
                 {/* Fallback Button for Hanging States */}
                 <button 
-                  onClick={() => setAreAssetsReady(true)}
+                  onClick={() => {
+                    setProcessedFrame(current => current || selectedFrame);
+                    setAreAssetsReady(true);
+                    setUploadStatus('idle');
+                  }}
                   className="mt-4 flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-full text-xs font-bold text-gray-600 hover:bg-gray-50 shadow-sm"
                 >
                   <AlertCircle size={14} /> Skip / Force Render
@@ -1914,6 +2229,14 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
             >
                 Retry
             </button>
+        </div>
+      )}
+
+      {(templateError || flowError) && (
+        <div role="alert" className="fixed top-20 left-1/2 -translate-x-1/2 z-[100] bg-red-950/95 border border-red-400/60 p-4 rounded-xl shadow-2xl max-w-xl w-[90%] flex items-center gap-3 text-white">
+          <AlertCircle className="text-red-300 shrink-0" size={24} />
+          <p className="flex-1 text-sm font-semibold">{flowError || templateError}</p>
+          <button onClick={() => { setFlowError(null); void refreshFrames(); }} className="px-3 py-2 rounded-lg bg-white text-red-950 text-xs font-bold">Retry</button>
         </div>
       )}
 
@@ -2325,15 +2648,13 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                  }`} style={isVertical ? { height: '36%' } : {}}>
                      {/* QR Code block */}
                      <div className={`bg-[#1b2b5a] rounded-3xl flex flex-col items-center justify-center border-4 transition-colors shrink-0 ${
-                       finalUploadedUrl ? 'border-green-400' : 'border-dashed border-white/20'
+                       downloadUrl ? 'border-green-400' : 'border-dashed border-white/20'
                      } ${isVertical ? 'h-full aspect-square p-1.5' : 'w-full max-w-[360px] p-8 mb-6 shadow-[0_10px_40px_rgba(0,0,0,0.5)]'}`}>
-                         {finalUploadedUrl ? (
+                         {downloadUrl ? (
                              <>
                                  <div className={`bg-white rounded-2xl shadow-xl animate-fade-in ${isVertical ? 'p-2 mb-1' : 'p-5 mb-5'}`}>
                                       {(() => {
-                                        const isBase64 = finalUploadedUrl.startsWith('data:');
-                                        const downloadPageUrl = `${window.location.origin}/download.html?url=${encodeURIComponent(finalUploadedUrl)}`;
-                                        const qrTarget = encodeURIComponent(downloadPageUrl);
+                                        const qrTarget = encodeURIComponent(downloadUrl);
                                         return (
                                           <img
                                             src={`https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=2&data=${qrTarget}`}
@@ -2348,7 +2669,12 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                              </>
                          ) : (
                              <div className="flex flex-col items-center text-white/40 text-center">
-                                 {uploadStatus === 'uploading' ? (
+                                 {uploadStatus === 'error' ? (
+                                     <>
+                                         <AlertCircle size={isVertical ? 32 : 80} className="text-red-400" />
+                                         <span className={`font-bold text-red-300 text-center ${isVertical ? 'text-xs mt-1' : 'text-lg mt-4 mb-4'}`}>{uploadError || 'Upload ke backend gagal.'}</span>
+                                     </>
+                                 ) : uploadStatus === 'uploading' ? (
                                      <>
                                          <Loader2 size={isVertical ? 32 : 80} className="opacity-50 animate-spin" />
                                          <span className={`font-bold ${isVertical ? 'text-xs mt-1' : 'text-lg mt-4 mb-4'}`}>Generating QR...</span>
@@ -2370,7 +2696,7 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                              <p className="text-white/60 text-center text-xs mb-2">Scan QR to download your photo</p>
                            </>
                          )}
-                         {isVertical && finalUploadedUrl && (
+                         {isVertical && downloadUrl && (
                            <p className="text-green-400 font-bold text-[11px] text-center">Scan to Download</p>
                          )}
                          <button
@@ -2391,25 +2717,40 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                  </div>
 
                  {/* Preview & actions panel – right in horizontal, bottom in vertical */}
-                 <div className={`flex-1 flex flex-col items-center overflow-hidden relative ${isVertical ? 'justify-between py-3 px-4' : 'justify-center p-6 h-full'}`}>
+                 <div className={`flex-1 flex flex-col items-center overflow-hidden relative ${isVertical ? 'justify-between py-3 px-4' : 'justify-center p-6 pb-28 h-full'}`}>
                     {/* Preview Image */}
                     <div className={`w-full flex items-center justify-center drop-shadow-[0_20px_50px_rgba(0,0,0,0.5)] ${isVertical ? 'flex-1 min-h-0' : 'h-full max-h-[70vh] mt-4'}`}>
                         <PreviewComponent maxHeightStr={isVertical ? '40vh' : '70vh'} shadow={true} id="final-preview-container" />
                     </div>
 
                     {/* Action Buttons */}
-                    <div className={`flex flex-wrap items-center justify-center gap-3 z-20 relative shrink-0 ${isVertical ? 'mt-2 pb-1' : 'mt-8'}`}>
+                    <div className={`flex flex-wrap items-center justify-center gap-3 z-20 relative shrink-0 ${isVertical ? 'mt-2 pb-1' : 'absolute bottom-6 right-6'}`}>
                         {selectedPackage === 'print' && (
-                            <button 
-                                id="btn-print"
-                                onClick={handlePrint}
-                                disabled={!areAssetsReady}
-                                className={`flex items-center gap-2 bg-[#ffffff] hover:bg-[#f0f0f0] text-black rounded-full shadow-[0_10px_20px_rgba(255,255,255,0.3)] transition-all active:scale-95 italic font-serif disabled:opacity-50 disabled:cursor-not-allowed ${isVertical ? 'px-8 py-2.5 text-base' : 'px-12 py-4 text-xl'}`}
-                            >
-                                <Printer size={isVertical ? 20 : 24} /> Print
-                            </button>
+                            <>
+                              <button 
+                                  id="btn-print"
+                                  onClick={handlePrint}
+                                  disabled={!areAssetsReady || isPrintActive || printState === 'success'}
+                                  className={`flex items-center gap-2 bg-[#ffffff] hover:bg-[#f0f0f0] text-black rounded-full shadow-[0_10px_20px_rgba(255,255,255,0.3)] transition-all active:scale-95 italic font-serif disabled:opacity-50 disabled:cursor-not-allowed ${isVertical ? 'px-8 py-2.5 text-base' : 'px-12 py-4 text-xl'}`}
+                              >
+                                  <Printer size={isVertical ? 20 : 24} className={isPrintActive ? 'animate-pulse' : ''} />
+                                  {isAutoPrintEnabled()
+                                    ? (printState === 'failed' ? 'Retry Print' : printState === 'success' ? 'Printed' : isPrintActive ? 'Printing...' : 'Print')
+                                    : 'Print'}
+                              </button>
+                              {isAutoPrintEnabled() && printState === 'failed' && isManualPrintFallbackEnabled() && (
+                                <button
+                                  id="btn-manual-print-fallback"
+                                  onClick={() => void handleManualPrint()}
+                                  disabled={!areAssetsReady}
+                                  className={`flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white border border-white/20 rounded-full transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${isVertical ? 'px-5 py-2.5 text-sm' : 'px-7 py-3 text-base'}`}
+                                >
+                                  <Printer size={isVertical ? 18 : 20} /> Print manual
+                                </button>
+                              )}
+                            </>
                         )}
-                        <button 
+                         <button 
                             id="btn-email"
                             onClick={() => {
                                 const emailForm = document.getElementById('email-form-container');
@@ -2418,14 +2759,30 @@ export const PhotoBooth: React.FC<PhotoBoothProps> = ({ onAdminClick }) => {
                                     emailForm.classList.toggle('flex');
                                 }
                             }}
-                            className={`flex items-center gap-2 bg-[#f6cd46] hover:bg-[#e5bc35] text-black rounded-full shadow-[0_10px_20px_rgba(246,205,70,0.3)] transition-all active:scale-95 italic font-serif ${isVertical ? 'px-8 py-2.5 text-base' : 'px-12 py-4 text-xl'}`}
+                            disabled={!areAssetsReady || isSending || uploadStatus === 'uploading' || uploadStatus === 'preparing'}
+                            className={`flex items-center gap-2 bg-[#f6cd46] hover:bg-[#e5bc35] text-black rounded-full shadow-[0_10px_20px_rgba(246,205,70,0.3)] transition-all active:scale-95 italic font-serif disabled:opacity-50 disabled:cursor-not-allowed ${isVertical ? 'px-8 py-2.5 text-base' : 'px-12 py-4 text-xl'}`}
                         >
                             Send Email
                         </button>
                     </div>
 
+                    {isAutoPrintEnabled() && printState !== 'idle' && (
+                      <div
+                        id="print-status"
+                        role="status"
+                        className={`absolute z-20 rounded-xl px-4 py-2 text-center text-sm font-bold ${isVertical ? 'bottom-14 left-1/2 -translate-x-1/2 max-w-[92%]' : 'bottom-24 right-6 max-w-[430px]'} ${printState === 'success' ? 'bg-green-500/20 text-green-300 border border-green-400/40' : printState === 'failed' ? 'bg-red-500/20 text-red-300 border border-red-400/40' : 'bg-white/10 text-white border border-white/20'}`}
+                      >
+                        {printState === 'preparing' && 'Menyiapkan foto final untuk dicetak...'}
+                        {printState === 'uploading' && 'Mengupload foto final...'}
+                        {printState === 'queued' && `Print queued${printJobId ? ` (${printJobId.slice(0, 8)}…)` : ''}`}
+                        {printState === 'printing' && 'Printer sedang mencetak...'}
+                        {printState === 'success' && 'Foto berhasil dicetak'}
+                        {printState === 'failed' && (printError || 'Print gagal. Silakan coba lagi.')}
+                      </div>
+                    )}
+
                     {/* Email Form Popover */}
-                    <div id="email-form-container" className={`hidden absolute left-1/2 -translate-x-1/2 bg-[#1b2b5a] rounded-2xl border border-white/10 shadow-2xl animate-fade-in z-30 flex-col gap-3 ${isVertical ? 'bottom-16 p-4 w-[300px]' : 'bottom-28 p-6 w-[400px]'}`}>
+                    <div id="email-form-container" className={`hidden absolute bg-[#1b2b5a] rounded-2xl border border-white/10 shadow-2xl animate-fade-in z-30 flex-col gap-3 ${isVertical ? 'left-1/2 -translate-x-1/2 bottom-16 p-4 w-[300px]' : 'right-6 bottom-24 p-6 w-[400px]'}`}>
                         {/* Form — selalu ada di DOM, disembunyikan saat sudah terkirim */}
                         <form onSubmit={handleSendEmail} className="flex flex-col gap-3" style={{ display: isSent ? 'none' : 'flex' }}>
                             <h3 className={`text-white font-bold ${isVertical ? 'text-sm' : 'text-lg'}`}>Send via Email</h3>
